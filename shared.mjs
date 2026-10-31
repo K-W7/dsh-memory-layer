@@ -47,6 +47,12 @@ export const DEFAULTS = {
   // 冷启动：库里还没攒出 trigger 关联时，召回层等于不存在，用户会觉得"没用"。
   // 活跃条目少于此值且本次零命中 → 回落注入最近写入的 N 条（仍受预算约束）。
   coldStartFallbackMax: 3, // 0=关闭冷启动兜底
+  // ---- v0.11.3：宿主注入开关（默认 true，保持现行为） ----
+  // 退成纯数据层（只存只查、不进 prompt）时三个全置 false；apply 时读取，
+  // 改完需重启宿主或重载插件才生效。false = 对应段根本不注册，不留空段占位。
+  injectSnapshot: true,   // 记忆快照段（systemPrompt.context，order -50）
+  injectRecall: true,     // 触发式召回段（systemPrompt.context，order -40）
+  injectSummary: true,    // 轮次结束沉淀提醒段（systemPrompt.section，order 200）
 }
 
 // 冲突阈值从配置读取（模块加载时为默认，apply 时更新）
@@ -74,6 +80,13 @@ export const PATHS = {
   config: path.join(MEMORY_ROOT, 'biomemory.config.json'), // 持久化配置（设置页写入，透明可改）
 }
 
+// 宽松布尔：只认 true/false、'true'/'false'、1/0、'1'/'0'；其余返回 undefined（保持默认）
+export function toBoolean(v) {
+  if (v === true || v === 1 || v === '1' || v === 'true') return true
+  if (v === false || v === 0 || v === '0' || v === 'false') return false
+  return undefined
+}
+
 // 配置持久化：从 biomemory.config.json 读取（不存在则用默认）
 export function loadConfig() {
   try {
@@ -98,6 +111,15 @@ export function loadConfig() {
         case 'nearDuplicateAction':
           merged[k] = v === 'skip' ? 'skip' : 'merge'
           break
+        case 'injectSnapshot':
+        case 'injectRecall':
+        case 'injectSummary': {
+          // v0.11.3：布尔项单独处理——旧 default 分支用 Number(v) > 0 判断，
+          // false 会被当成「无效」丢掉并回落到默认 true，等于关不掉。
+          const b = toBoolean(v)
+          if (b !== undefined) merged[k] = b
+          break
+        }
         default:
           // 其余为数值项：只接受有限正数（保持原语义）
           if (Number.isFinite(Number(v)) && Number(v) > 0) merged[k] = Number(v)

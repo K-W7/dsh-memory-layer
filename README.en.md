@@ -2,7 +2,7 @@
 
 > **A memory layer for DeepSeek Harness**: one local file, zero services, zero API calls — recall driven by **trigger signals**, so the right memory shows up at the right moment.
 
-**v0.11.2** · MIT License · DSH 0.2.x (`>=0.2.0-rc.2 <0.3.0-0`, tested on the 0.2.1-rc.3 desktop app) · Node >= 22.19.0
+**v0.11.3** · MIT License · DSH 0.2.x (`>=0.2.0-rc.2 <0.3.0-0`, tested on the 0.2.1-rc.3 desktop app) · Node >= 22.19.0
 
 ---
 
@@ -98,8 +98,12 @@ Restart DSH afterwards (profiles with HMR hot-mount it).
 | `remove` | Tombstone (row stays; `restore` brings it back) |
 | `purge` | **Physical delete** (irreversible; auto-backs-up the DB first) |
 | `restore` / `pin` / `unpin` | Roll back / pin / unpin |
-| `compact` | Run the five rules (`dryRun=true` to preview; auto-backs-up before writing) |
+| `compact` | Run the five rules (`dryRun=true` to preview; only changes status, no backup copy) |
 | `dump` | Export human-readable Markdown (keeps the latest 10) |
+
+When `add` / `update` stores text containing a relative time word (today / yesterday / next week …)
+without an absolute date anchor (`YYYY-MM-DD`, `M月D日`, `20xx年`), the successful result's `note` gains
+one reminder line. **The write still succeeds** — refusing would lose information.
 
 A second tool, `memory_recall`, is available for explicit "do you remember..." lookups.
 
@@ -148,6 +152,14 @@ Important memories (user preferences / decisions / corrections) go through DSH's
 | `decisionChannelMax` | 3 | Max items per turn in the preference/decision channel (0 = off) |
 | `decisionChannelChars` | 400 | Char budget for that channel (0 = off) |
 | `coldStartFallbackMax` | 3 | Cold-start fallback items (0 = off) |
+| `injectSnapshot` | true | **Host injection switch**: always-on snapshot section (order -50). false = the section is not registered at all |
+| `injectRecall` | true | **Host injection switch**: triggered-recall section (order -40) |
+| `injectSummary` | true | **Host injection switch**: end-of-turn settle nudge section (order 200) |
+
+The three `inject*` keys are **host injection switches**. They default to true (current behaviour);
+set all of them to false to run as a **pure data layer** (store/query only, nothing enters the prompt).
+They are read during `apply`, so a restart or plugin reload is required — editing `biomemory.config.json`
+alone does not hot-switch them.
 
 ## Deliberately not done
 
@@ -160,6 +172,7 @@ Important memories (user preferences / decisions / corrections) go through DSH's
 
 | Version | Date | Changes |
 |---|---|---|
+| **v0.11.3** | 2026-10-31 | **Preparing the data-layer-only mode + date check**: added host injection switches `injectSnapshot` / `injectRecall` / `injectSummary` (default true = current behaviour; all false = store/query only, nothing enters the prompt; read during `apply`, reload required). When text contains a relative time word and no absolute date anchor (`YYYY-MM-DD` / `M月D日` / `20xx年`), `add` / `update` still succeed but the result gains a one-line reminder. "最近 / 目前" do not trigger it |
 | **v0.11.2** | 2026-10-31 | **Repository re-baselined on the released 0.11.1 tarball** (the 0.11.0/0.11.1 source tree was lost; module code is byte-identical to 0.11.1). Dev-side fixes: README version exposure, ARCHITECTURE test reference, SECURITY supported versions / false `audit.log` claim, CI Node 22.19 matrix, `.gitignore`; two pre-0.11 test cases removed and the same-key case switched to exact keys; stale `pnpm-lock.yaml` deleted. No functional change. See `CHANGELOG.md` |
 | **v0.11.1** | 2026-10-28 | **No automatic DB copies on any write path + tests shipped**: `compact` / `purge` / fingerprint migration all stop writing backup copies (tombstones are revived by `restore`; `purge` must not leave a copy behind; `backupDb()` stays as a manual entry point); `files` now ships `tests/core.test.mjs` so `npm test` works after install. See `CHANGELOG.md` |
 | **v0.11.0** | 2026-10-27 | **Correctness & observability**: fixed `includeArchived` returning deleted tombstones; `remove` is now a real tombstone (physical delete moved to `purge`); fingerprints are now full-text hashes (the old first-20-chars hash collided and silently dropped memories) with a one-shot re-migration; same-key overwrite is now an exact match (prefix matching tombstoned unrelated entries); injection and real usage are counted separately (`last_accessed` vs `last_used`) so cleanup rules are no longer starved by self-feedback; realm is inferred from the session cwd on write; session state and signals are per-session; local HTTP endpoints validate origin; `selfHeal` no longer throws; `compact` backs up before writing. **Added**: preference/decision channel, cold-start fallback, `/memory stats` (incl. trigger coverage) / `why` / `preview` / `used` / `purge` / `unarchive` / `help`, snapshot caching, dump rotation |

@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-layer",
   "description": "Remembers preferences and decisions across sessions and brings them back in new ones; data stays on your machine.",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
@@ -48,6 +48,7 @@
     "snapshot.mjs",
     "gate.mjs",
     "session-state.mjs",
+    "time.mjs",
     "cordis.patch.yml",
     "locale",
     "tests",

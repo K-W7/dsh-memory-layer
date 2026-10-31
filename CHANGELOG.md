@@ -3,6 +3,28 @@
 All notable changes to dsh-memory-layer. The canonical history also lives in the README
 version-history table; this file exists so the changes are visible on npm and in the tarball.
 
+## v0.11.3 — 2026-10-31
+
+### Added
+
+- **Host-injection switches** `injectSnapshot` / `injectRecall` / `injectSummary` (default `true`,
+  behaviour unchanged). `false` means the corresponding prompt section is **not registered at all**
+  (no empty placeholder), so the plugin can run as a pure data layer: store and query only, nothing
+  enters the system prompt. They are read in `apply`, so a host restart or plugin reload is required.
+  Motivated by the 2026-10-31 decision to let a second memory plugin own prompt injection and keep
+  this one as the structured data layer.
+- **Absolute-date reminder on writes** (`time.mjs`): when `add` / `update` text contains a relative
+  time word (今天/昨天/明天/后天/前天/本周/这周/上周/下周/这个月/上个月/下个月/今年/去年/明年) and no
+  date anchor (`YYYY-MM-DD`, `M月D日`, `20xx年`), the successful result's `note` gets one reminder
+  line. The write still succeeds — rejecting it would lose information. 最近/目前/现在 deliberately do
+  not trigger. Idea borrowed from dsh-agent-vault's `time.js`.
+
+### Fixed
+
+- Booleans in `biomemory.config.json` now round-trip: `loadConfig` handles the three switches
+  explicitly (the generic numeric branch dropped `false` and silently re-enabled them), and the
+  `/config` endpoint stores them via `toBoolean` instead of `Number()`.
+
 ## v0.11.2 — 2026-10-31
 
 ### Changed (repository re-baselined; no functional change)

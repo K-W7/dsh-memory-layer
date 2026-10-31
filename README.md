@@ -2,7 +2,7 @@
 
 > **给 DeepSeek Harness 的记忆层**：记住你的偏好和决定，换个会话它自己会想起来；数据只在本机，随时能查能改。
 
-**v0.11.2** · MIT License · DSH 0.2.x（`>=0.2.0-rc.2 <0.3.0-0`，0.2.1-rc.3 桌面版实测）· Node ≥ 22.19.0
+**v0.11.3** · MIT License · DSH 0.2.x（`>=0.2.0-rc.2 <0.3.0-0`，0.2.1-rc.3 桌面版实测）· Node ≥ 22.19.0
 
 ---
 
@@ -121,6 +121,8 @@ dsh plugin --profile desktop add link:./dsh-memory-layer
 | `compact` | 按五条规则清理（`dryRun=true` 只预览；实跑只改 `status`，不备份） |
 | `dump` | 导出人类可读 Markdown（含工作流链；保留最近 10 份） |
 
+写入（`add` / `update`）时，若正文含「今天 / 昨天 / 下周」等相对时间却没有绝对日期锚点（`YYYY-MM-DD`、`M月D日`、`20xx年`），成功返回的 `note` 会附一行提醒；**写入照常成功，不拒绝**——因为拒绝会丢信息。
+
 还有一个 `memory_recall` 工具，用于"你还记得…吗"式的显式召回。
 
 ### 命令 `/memory`
@@ -172,6 +174,11 @@ dsh plugin --profile desktop add link:./dsh-memory-layer
 | `decisionChannelMax` | 3 | 偏好/决定通道每轮最多注入条数（0=关闭） |
 | `decisionChannelChars` | 400 | 偏好/决定通道每轮字符预算（0=关闭） |
 | `coldStartFallbackMax` | 3 | 冷启动兜底条数（0=关闭） |
+| `injectSnapshot` | true | **宿主注入开关**：记忆快照段（order -50）。false = 该段完全不注册 |
+| `injectRecall` | true | **宿主注入开关**：触发式召回段（order -40） |
+| `injectSummary` | true | **宿主注入开关**：轮次结束沉淀提醒段（order 200） |
+
+三个 `inject*` 是「宿主注入开关」：默认 true 保持现行为；**退成纯数据层（只存只查、不进 prompt）时全置 false**。它们在插件 `apply` 时读取，改完需重启宿主或重载插件才生效（只改 `biomemory.config.json` 不会热切换）。
 
 ## 设计上刻意不做的事
 
@@ -184,6 +191,7 @@ dsh plugin --profile desktop add link:./dsh-memory-layer
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| **v0.11.3** | 2026-10-31 | **退成数据层的准备 + 日期校验**：新增宿主注入开关 `injectSnapshot` / `injectRecall` / `injectSummary`（默认 true 保持现行为；全置 false = 只存只查、完全不进 prompt；`apply` 时读取，改后需重载）。写入含相对时间（今天/昨天/下周…）且无绝对日期锚点时，`add` / `update` 的成功返回附一行提醒，写入照常成功（锚点：`YYYY-MM-DD` / `M月D日` / `20xx年`；「最近 / 目前」不触发） |
 | **v0.11.2** | 2026-10-31 | **按已发布的 0.11.1 回灌仓库 + 收口**：0.11.0/0.11.1 的源码树丢失，以 tgz 为准恢复模块（代码与 0.11.1 逐字节一致，功能无变更）；README 版本曝光、ARCHITECTURE 测试指向、SECURITY 支持版本与 audit.log 说明、CI Node 22.19 矩阵、.gitignore 白名单同步修正；删除 2 条 0.10 语义旧用例、同键覆盖用例改为全等键；删除 stale `pnpm-lock.yaml`。详见 `CHANGELOG.md` |
 | **v0.11.1** | 2026-10-28 | **写库不再自动备份 + 测试随包发布**：`compact` / `purge` / 指纹迁移口径统一为「不落备份副本」（墓碑可 `restore`，`purge` 反而不能留副本，`backupDb()` 降为手工入口）；`files` 补 `tests` 并新增 `tests/core.test.mjs`（零依赖，装完即可 `npm test`）。详见 `CHANGELOG.md` |
 | **v0.11.0** | 2026-10-27 | **数据正确性与可观测性**：修 `includeArchived` 会返回已删除墓碑条目；`remove` 改为真墓碑（物理删除收敛到 `purge`）；指纹改全文哈希（旧算法前 20 字撞车会静默丢记忆）+ 一次性重算迁移；同键覆盖改全等（前缀匹配会误墓碑）；注入与真实使用分开计数（`last_accessed` / `last_used`），清理规则不再被自反馈喂饱；写入路径按会话 cwd 推断 realm；沉淀状态与会话信号按会话分桶；本地 HTTP 端点加来源校验；`selfHeal` 不再抛出。**新增**：偏好/决定独立通道、冷启动兜底、`/memory stats`（含 trigger 覆盖率）/ `why` / `preview` / `used` / `purge` / `unarchive` / `help`、快照缓存、dump 轮转 |

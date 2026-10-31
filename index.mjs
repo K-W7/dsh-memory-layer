@@ -21,7 +21,7 @@ import * as db from './db.mjs'
 
 // ---------- 分组导入（shared/store/retrieve/snapshot/gate/compact/recall） ----------
 import {
-  CFG, DEFAULTS, PATHS, setConfig,
+  CFG, DEFAULTS, PATHS, setConfig, toBoolean,
   loadConfig, saveConfig,
   ensureDirs, dbgLog, MEMORY_ROOT, projectRealm,
   fingerprint, isImportant, estimateTokens, zhBigrams,
@@ -37,6 +37,7 @@ import { renderSnapshot, sessionSummarySectionText, handleSessionEvent } from '.
 import { gateWrite, selfHeal } from './gate.mjs'
 import { compact, dump } from './compact.mjs'
 import { recallBySignals, buildInjection, explain } from './recall.mjs'
+import { needsAbsoluteDate } from './time.mjs'
 import { markSummaryPending, clearSummaryPending, isSummaryPending } from './session-state.mjs'
 
 export const inject = ['tools', 'systemPrompt']
@@ -149,6 +150,13 @@ function readBody(req) {
 
 // ---------- 工具定义（官方 ToolDefinition：parameters + output + execute） ----------
 
+// v0.11.3：写入时的绝对日期提醒（只提醒，不拒绝——拒绝会丢信息）。
+function dateHint(text) {
+  const word = needsAbsoluteDate(text)
+  if (!word) return ''
+  return `提示：正文含相对时间（${word}）但没有 YYYY-MM-DD 锚点，读的人可能是几周后的另一个会话，建议补绝对日期。`
+}
+
 function makeMemoryTool(ctx) {
   return {
     name: 'memory',
@@ -220,13 +228,14 @@ function makeMemoryTool(ctx) {
         const g = await gateWrite(ctx, { track, text: text.trim(), agent: exec.agent, callId: exec.callId, signal: exec.signal })
         if (!g.approved) return { ok: false, error: `写入未获批准（${g.outcome || 'denied'}）——重要记忆需人工审批（可设置 approvalFallback=auto 自动保存）` }
         const r = writeEntry({ track, text: text.trim(), sessionId, approved: g.mode === 'ask', mode: g.mode, source, realm: realmFor(sessionId) })
+        const hint = dateHint(text.trim())
         // v0.8.0：近似重复（写入去重）——已自动合并进已有条目，或（skip 模式）只提示不写
         if (r.merged) {
           return {
             ok: true,
             ...r,
             mode: g.mode,
-            note: `已合并进已有条目 [fp:${r.fp}]（相似度 ${r.similar.score}，追加「补充·日期」并提权）——未新增碎片条目。`,
+            note: `已合并进已有条目 [fp:${r.fp}]（相似度 ${r.similar.score}，追加「补充·日期」并提权）——未新增碎片条目。${hint ? '\n' + hint : ''}`,
           }
         }
         if (r.skipped && r.reason === 'near-duplicate') {
@@ -237,7 +246,7 @@ function makeMemoryTool(ctx) {
             note: `未新增：与已有条目 [fp:${r.similar.fp}] 高度相似（${r.similar.score}）。请改用 memory action=update fp="${r.similar.fp}" text="合并后的完整内容"，避免同一件事留下多条碎片记忆。`,
           }
         }
-        return { ok: true, ...r, mode: g.mode }
+        return { ok: true, ...r, mode: g.mode, ...(hint ? { note: hint } : {}) }
       }
       if (action === 'query') {
         const fts = typeof fragmentTypes === 'string' && fragmentTypes.trim()
@@ -249,7 +258,10 @@ function makeMemoryTool(ctx) {
       if (action === 'update') {
         if (!fp || !String(text ?? '').trim()) return { ok: false, error: 'fp 与 text 必填（先 list/query 找到指纹）' }
         const r = updateEntryText(fp, String(text).trim())
-        return r.ok ? { ok: true, note: r.note || `已更新 [fp:${fp}]`, fp } : r
+        if (!r.ok) return r
+        const hint = dateHint(String(text).trim())
+        const base = r.note || `已更新 [fp:${fp}]`
+        return { ok: true, note: hint ? `${base}\n${hint}` : base, fp }
       }
       if (action === 'remove') {
         if (!fp) return { ok: false, error: 'fp 必填（先 query 找到指纹）' }
@@ -511,33 +523,42 @@ export function apply(ctx, config = {}) {
   // v0.8.1：按需抽取要用到的宿主服务——懒注入，服务缺失时接口返回明确错误而不是崩
 
   // 1. 动态记忆上下文（每次对话/新会话组装提示词时自动重新求值 → 最新记忆同步）
-  ctx.systemPrompt.context({
-    name: 'memory:snapshot',
-    order: -50,
-    text: () => renderSnapshot(),
-  })
+  // v0.11.3：injectSnapshot=false 时**不注册**该段（而不是注册一个返回 '' 的空段）。
+  if (toBoolean(CFG.injectSnapshot) !== false) {
+    ctx.systemPrompt.context({
+      name: 'memory:snapshot',
+      order: -50,
+      text: () => renderSnapshot(),
+    })
+  }
 
   // 1.2 v2 触发式召回：本次会话的信号命中了才注入，没命中不占 token
-  ctx.systemPrompt.context({
-    name: 'memory:triggered',
-    order: -40,
-    text: () => recallSectionText(),
-  })
+  if (toBoolean(CFG.injectRecall) !== false) {
+    ctx.systemPrompt.context({
+      name: 'memory:triggered',
+      order: -40,
+      text: () => recallSectionText(),
+    })
+  }
 
   // 1.5 会话结束自动沉淀（v0.6）：turn/end(completed) 后注入总结指令
   // v0.11：这里的 catch 是**静默**的——一旦宿主不暴露 session/event，触发式召回与自动沉淀
   // 会一起失效且毫无提示。补偿手段放在 recallSectionText()：从未收到事件时 warn 一次，
   // 用户可用 /memory preview 与 /memory stats 自查。
   try {
+    // 信号采集必须一直开着：/memory preview、/memory why 都依赖它。
+    // 这里只按 injectSummary 决定「沉淀提醒段」是否注册。
     ctx.on('session/event', (session, rawEvent) => {
       handleSessionEvent(session, rawEvent)
       noteSignal(session, rawEvent)
     }, { global: true })
-    ctx.systemPrompt.section({
-      name: 'memory:session-summary',
-      order: 200,
-      text: () => sessionSummarySectionText(),
-    })
+    if (toBoolean(CFG.injectSummary) !== false) {
+      ctx.systemPrompt.section({
+        name: 'memory:session-summary',
+        order: 200,
+        text: () => sessionSummarySectionText(),
+      })
+    }
   } catch {
     // 会话事件/提示词注入不可用则静默降级（不影响记忆读写）
   }
@@ -580,7 +601,7 @@ export function apply(ctx, config = {}) {
           if (req.method === 'POST' && p === '/config') {
             let body = {}
             try { body = JSON.parse(await readBody(req)) } catch { /* ignore */ }
-            const allowed = ['decayThreshold', 'weightCap', 'hotTokenLimit', 'maxQueryResults', 'approvalFallback', 'nearDuplicateThreshold', 'nearDuplicateAction', 'sinkWindowMinutes', 'decisionChannelMax', 'decisionChannelChars', 'coldStartFallbackMax']
+            const allowed = ['decayThreshold', 'weightCap', 'hotTokenLimit', 'maxQueryResults', 'approvalFallback', 'nearDuplicateThreshold', 'nearDuplicateAction', 'sinkWindowMinutes', 'decisionChannelMax', 'decisionChannelChars', 'coldStartFallbackMax', 'injectSnapshot', 'injectRecall', 'injectSummary']
             if (body.reset === true) {
               try { fs.unlinkSync(PATHS.config) } catch { /* ignore */ }
               setConfig({ ...DEFAULTS })
@@ -593,6 +614,11 @@ export function apply(ctx, config = {}) {
                 // 旧代码除 approvalFallback 外一律 Number()，于是：
                 if (k === 'approvalFallback') next[k] = body[k] === 'auto' ? 'auto' : 'deny'
                 else if (k === 'nearDuplicateAction') next[k] = body[k] === 'skip' ? 'skip' : 'merge'
+                else if (k === 'injectSnapshot' || k === 'injectRecall' || k === 'injectSummary') {
+                  // v0.11.3：布尔项按布尔落库——走 Number() 会把 false 存成 0，
+                  // 下次 loadConfig 再被「只收正数」丢掉，等于关不掉。
+                  next[k] = toBoolean(body[k]) ?? next[k]
+                }
                 else {
                   const v = Number(body[k])
                   if (Number.isFinite(v) && v >= 0) next[k] = v
