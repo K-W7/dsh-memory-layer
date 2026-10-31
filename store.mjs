@@ -176,7 +176,10 @@ export function writeEntry({ track, text, sessionId, approved, mode, source, rea
     return { ok: true, skipped: true, reason: 'duplicate' }
   }
   const modeLabel = mode === 'fallback' ? '降级' : (mode === 'ask' ? '审批' : (mode === 'auto' ? '自动' : (approved ? '审批' : '自动')))
-  const layer = track === 'user' ? 'longterm' : 'longterm'
+  // v0.11：原来这里写的是 `track === 'user' ? 'longterm' : 'longterm'`（两个分支相同）。
+  // 分层（hot/projects/longterm）在单轨制后已名存实亡，layer 恒为 longterm；
+  // 直接写成常量，别再让人以为它还有分支语义。
+  const layer = 'longterm'
   const fragmentType = track === 'user' ? (isImportant(text, track) ? 'preference' : 'fact') : 'lesson'
   // ---- v2：realm / type / trigger / key（触发式召回的最小三元组） ----
   const realmKey = realm || 'user'
@@ -188,7 +191,11 @@ export function writeEntry({ track, text, sessionId, approved, mode, source, rea
   let sameKey = false
   if (mkey) {
     for (const e of db.allEntries()) {
-      const keyHit = e.mkey && (e.mkey === mkey || e.mkey.startsWith(mkey) || mkey.startsWith(e.mkey))
+      // v0.11：改为**全等**比较。旧实现是双向 startsWith 前缀匹配，而 mkey 最短 6 字，
+      // 于是短 key 会成为长 key 的前缀——「决定：发布走Gitee。第二段完全不同」会被后来的
+      // 「决定：发布走Gitee，具体是每周五执行」判为同键并墓碑（内容不同却被覆盖）。
+      // 同键覆盖的语义是"同一件事只留最新一条"，前缀匹配把这个范围放大得太多。
+      const keyHit = e.mkey && e.mkey === mkey
       if (e.fp !== fp && keyHit && (e.realm || 'user') === realmKey && (e.mtype || 'fact') === mtype) {
         db.setStatus(e.fp, 'deleted')
         sameKey = true
@@ -202,8 +209,13 @@ export function writeEntry({ track, text, sessionId, approved, mode, source, rea
   // 带 trigger 的写入不合并（每次出现都是该 trigger 的上一步，供链使用）；同键已覆盖时也不再合并
   if (!sameKey && !trigger && Number.isFinite(nearThr) && nearThr > 0) {
     let best = null
+    const lenT = String(text || '').length
     for (const e of db.allEntries()) {
       if (e.fragment_type !== fragmentType || (e.realm || 'user') !== realmKey) continue
+      // v0.11：长度预筛——ratio<0.6 时 bigramSimilarity 走的是 Jaccard 分支，
+      // 而 Jaccard ≤ ratio，所以 ratio 已低于阈值时无需再算 bigram（省掉 O(N) 次集合运算）。
+      const lenE = String(e.text || '').length
+      if (lenT && lenE && Math.min(lenT, lenE) / Math.max(lenT, lenE) < Math.min(nearThr, 0.6)) continue
       const score = bigramSimilarity(text, e.text)
       if (!best || score > best.score) best = { fp: e.fp, score, text: String(e.text || ''), weight: e.weight, entry_id: e.entry_id }
     }
@@ -250,14 +262,16 @@ export function writeEntry({ track, text, sessionId, approved, mode, source, rea
   // v0.6.1 单轨制：不再 append 到 preferences.md——SQLite 是唯一运行时数据源，
   // Markdown 仅保留为只读备份（曾因双轨导致 Markdown 新条目永不注入，见 2026-09-06 整理）
   // v0.6 会话沉淀：模型调 memory add 写入成功 → 视为"已沉淀"，清除待沉淀标记
-  clearSummaryPending()
+  // v0.11：按会话精确清除（多会话并行时不再互相清掉对方的标记）
+  clearSummaryPending(sessionId)
   return { ok: true, fp, mtype, trigger, chain } 
 }
 
 /** v2 适配层：同 trigger 的活跃条目 >3 条时，升级为 workflow 并生成「当 X 时：先 A，再 B」的链 */
 export function promoteIfRepeated(trigger, realmKey) {
   if (!trigger) return null
-  if (db.countByTrigger(trigger) <= 3) return null
+  // v0.11：带上 realm，与 bumpTrigger 的 (trigger, realm) 计数口径一致
+  if (db.countByTrigger(trigger, realmKey) <= 3) return null
   const rows = db.byTrigger([trigger], { realm: realmKey })
   for (const e of rows) if (e.mtype !== 'workflow') db.upsertEntry({ fp: e.fp, mtype: 'workflow' })
   const steps = rows
@@ -289,21 +303,86 @@ export function consolidateHits(fpSet) {
   if (!fpSet || !fpSet.size) return 0
   db.openDb()
   for (const fp of fpSet) {
-    // 顺带记录召回时间（last_accessed）：清理规则里的「久未使用」判据就靠这一列，
-    // 旧实现从不更新该列，导致久不使用的条目也一直涨权。
-    db.touchEntry(fp, { hitsDelta: 1, accessed: true })
+    // v0.11：模型主动查询命中 = **真实使用**，同时推进 hits 与 last_used。
+    // 旧实现只更新 last_accessed（"被看到"），而触发召回注入也写同一列，
+    // 于是"想起过一次"就等价于"用过一次"，compact 的 30/90 天判据被自己刷新掉。
+    db.touchEntry(fp, { hitsDelta: 1, used: true, accessed: true })
   }
   return fpSet.size
 }
 
-// 安全删除：先备份数据库再删条目（可回滚）
+/**
+ * 删除 = 标墓碑（可回滚）。
+ *
+ * v0.11：旧实现走 `db.removeByFp` **物理删除**整行，与 README「删除是墓碑，不物理删」、
+ * SECURITY 语义以及 v0.10.1 刚修好的"墓碑可复活"直接冲突——那条修复只在 compact 路径上
+ * 有效，用户手动 remove 过的条目永远救不回来，只剩 7 份滚动备份兜底（备份刷新 7 次即永久丢失）。
+ * 现在 remove 只改 status，行还在库里，`restore` 一定能救回来。
+ */
 export function removeEntry(fp) {
   db.openDb()
   const e = db.getByFp(fp)
   if (!e) return { ok: false, error: `未找到 [fp:${fp}]` }
-  const bk = db.backupDb()
+  if (e.status === 'deleted') return { ok: false, error: `[fp:${fp}] 已在墓碑中，无需重复删除` }
+  db.setStatus(fp, 'deleted')
+  return { ok: true, fp, layer: e.layer, text: e.text, tombstone: true }
+}
+
+/**
+ * 真正的物理删除（不可逆）——只给"这条记忆不该留在磁盘上"的场景（如误存了密钥）。
+ *
+ * **不做备份**：本动作的目的就是"让这段内容从磁盘上消失"，先写一份全库备份等于换个路径
+ * 把它又留在同一台机器上（备份目录就在数据库旁边），与 purge 的语义直接矛盾。
+ * 需要事前快照的话，是使用者自己的事：`/memory dump` 导出 Markdown，或手工拷库。
+ * 默认入口 `removeEntry` 只打墓碑，不会走到这里。
+ */
+export function purgeEntry(fp) {
+  db.openDb()
+  const e = db.getByFp(fp)
+  if (!e) return { ok: false, error: `未找到 [fp:${fp}]` }
   db.removeByFp(fp)
-  return { ok: true, fp, layer: e.layer, text: e.text, backup: bk }
+  return { ok: true, fp, layer: e.layer, text: e.text, purged: true }
+}
+
+/** 显式标记"这条记忆刚才真的用上了"：更新 last_used 与 hits。
+ *  触发召回的注入只刷新 last_accessed（被看到），不算使用——两者混在一起会让清理规则失效。 */
+export function markUsed(fp) {
+  db.openDb()
+  const e = db.getByFp(fp)
+  if (!e) return { ok: false, error: `未找到 [fp:${fp}]` }
+  db.touchEntry(fp, { hitsDelta: 1, used: true, accessed: true })
+  return { ok: true, fp, hits: Number(e.hits || 0) + 1 }
+}
+
+/**
+ * v0.11：指纹算法升级（前 20 字 djb2 → 全文 sha1）后的一次性重算。
+ * 只跑一次（meta.fp_v2_at 标记）。重算过程中若发现内容完全一致的重复条目，
+ * 保留最早的一条、其余标墓碑——这正是旧算法碰撞留下的烂摊子。
+ */
+export function migrateFingerprints() {
+  db.openDb()
+  if (db.metaGet('fp_v2_at') !== null) return { migrated: false, reason: 'already' }
+  const all = db.allEntries({ includeArchived: true })
+  const claimed = new Set()
+  let changed = 0
+  let deduped = 0
+  for (const e of all) {
+    const next = fingerprint(String(e.text || ''))
+    if (!next) continue
+    if (next === e.fp) { claimed.add(next); continue }
+    if (claimed.has(next)) {
+      db.setStatus(e.fp, 'deleted')
+      deduped++
+      continue
+    }
+    try {
+      db.openDb().prepare('UPDATE entries SET fp = ? WHERE entry_id = ?').run(next, e.entry_id)
+      claimed.add(next)
+      changed++
+    } catch { /* 撞上唯一约束则保留原 fp */ claimed.add(e.fp) }
+  }
+  db.metaSet('fp_v2_at', db.isoNow())
+  return { migrated: true, changed, deduped }
 }
 
 // 取消归档（v0.8.0）：status 由 archived 改回 active，可顺带校准权重。

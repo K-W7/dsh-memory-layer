@@ -9,6 +9,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import crypto from 'node:crypto'
 import * as db from './db.mjs'
 
 // 记忆根目录：默认 ~/.dsh/memory（可用环境变量 DSH_MEMORY_ROOT 覆盖）
@@ -26,7 +27,9 @@ export const REQUEST_MARKER = '[dsh-memory-layer]'
 export const DEFAULTS = {
   decayThreshold: 3,      // 权重低于此值 → 状态页标「待处理」（v0.10.0 起不再自动归档，归档只由 compact 五条规则决定）
   weightCap: 20,          // 权重上限（防膨胀）
-  hotTokenLimit: 5000,    // 快照注入热区 token 上限
+  hotTokenLimit: 2000,    // 快照注入 token 上限（v0.11：5000→2000。快照是常驻注入，触发召回才是
+                          // 精准通道；旧默认让"每轮固定开销"占了 token 大头，与"没命中就不占
+                          // token"的印象相反。想恢复全量注入可自行调大）
   maxQueryResults: 20,    // 查询返回上限
   approvalFallback: 'deny', // v0.6.5 起默认 deny（fail-closed）：审批服务缺失/请求异常/非授予结果 → 拒绝写入并记审计；auto=自动保存并审计（旧行为，需显式设置）
   nearDuplicateThreshold: 0.7, // v0.8.0：写入去重——与已有同类条目的中文 bigram Jaccard ≥ 此值时不再新增（0=关闭；
@@ -35,6 +38,15 @@ export const DEFAULTS = {
   sinkWindowMinutes: 5,   // v0.8.0：轮次结束后的「请沉淀」提醒有效窗口（分钟，可配）。
                           // 语义：一轮结束后短暂窗口内注入一次催促；超过窗口即丢弃（下一轮重新判断），
                           // 避免用户隔很久再发消息时被一条过期的「上一轮请沉淀」打扰。
+  // ---- v0.11：偏好/决定独立通道与冷启动兜底 ----
+  // 触发式召回只能命中含文件名/错误代号的记忆，而"偏好/决定"是纯自然语言（实测 8 条里
+  // 6 条无任何 trigger），它们只能靠常驻快照出场、并随记忆增长被挤出预算。
+  // 这里给 decision/preference 一条独立小预算，不与触发召回抢 1200 字符。
+  decisionChannelMax: 3,  // 偏好/决定通道每轮最多注入条数（0=关闭）
+  decisionChannelChars: 400, // 偏好/决定通道每轮字符预算（0=关闭）
+  // 冷启动：库里还没攒出 trigger 关联时，召回层等于不存在，用户会觉得"没用"。
+  // 活跃条目少于此值且本次零命中 → 回落注入最近写入的 N 条（仍受预算约束）。
+  coldStartFallbackMax: 3, // 0=关闭冷启动兜底
 }
 
 // 冲突阈值从配置读取（模块加载时为默认，apply 时更新）
@@ -156,11 +168,22 @@ export function prefsText() {
 export function isoNow() { return new Date().toISOString() }
 
 export function fingerprint(text) {
-  // 内容前 20 字的简单指纹（去重用）
-  const t = text.replace(/\s+/g, '').slice(0, 20)
-  let h = 0
-  for (let i = 0; i < t.length; i++) h = ((h << 5) - h + t.charCodeAt(i)) | 0
-  return (h >>> 0).toString(16)
+  // v0.11：全文 sha1 前 16 位。
+  //
+  // 旧实现取"去空白后的前 20 字"做 djb2：中文里 20 字极易撞车（同一决定的不同表述、
+  // 同一流程的不同步骤、同一个文件名的多条教训），撞了之后 writeEntry 开头就判
+  // `duplicate` 直接跳过——那条记忆**静默丢失**，模型只看到"重复记忆，已跳过"。
+  // 指纹的职责应当只是"内容是否完全一致"；语义层面的近似重复交给 bigramSimilarity。
+  const norm = String(text ?? '').replace(/\s+/g, '')
+  if (!norm) return ''
+  return crypto.createHash('sha1').update(norm, 'utf8').digest('hex').slice(0, 16)
+}
+
+/** realm 归一化：无 cwd 时为全局 'user'，否则为 project:<规范化工作目录> */
+export function projectRealm(cwd) {
+  const v = String(cwd ?? '').trim()
+  if (!v) return 'user'
+  return 'project:' + v.toLowerCase().replace(/\\/g, '/').replace(/\/+$/, '')
 }
 
 export function isImportant(text, track) {

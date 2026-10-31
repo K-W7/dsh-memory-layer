@@ -111,8 +111,9 @@ test('db：工作流链 写入 / 读取 / 计数', () => {
 // ---------- 写入路径：同键覆盖 / 工作流升级 ----------
 
 test('writeEntry：同 realm+type+key 的新条覆盖旧条（旧条墓碑，不物理删）', () => {
-  const a = store.writeEntry({ track: 'agent', text: '决定：发布都走 Gitee 同步', approved: true, mode: 'auto', realm: 'user' })
-  const b = store.writeEntry({ track: 'agent', text: '决定：发布都走 Gitee 同步（改版）', approved: true, mode: 'auto', realm: 'user' })
+  // v0.11：同键覆盖是全等比较，首句（前 24 字归一化后）必须完全一致
+  const a = store.writeEntry({ track: 'agent', text: '决定：发布都走 Gitee 同步。补充：先看 A 文档', approved: true, mode: 'auto', realm: 'user' })
+  const b = store.writeEntry({ track: 'agent', text: '决定：发布都走 Gitee 同步。补充：后看 B 文档', approved: true, mode: 'auto', realm: 'user' })
   assert.ok(a.fp && b.fp)
   assert.equal(db.getByFp(a.fp)?.status, 'deleted', '旧条目标墓碑')
   assert.equal(db.getByFp(b.fp)?.status, 'active', '新条是活跃')

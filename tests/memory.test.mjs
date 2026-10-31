@@ -309,24 +309,6 @@ test('queryEntries 带关键词查询自动巩固命中条目（v0.5：SQLite）
 })
 
 // ============================================================================
-// 18. removeEntry —— 安全删除（先备份）
-// ============================================================================
-
-test('removeEntry：删除条目并自动备份数据库（v0.5：SQLite）', async () => {
-  const db = await import('../db.mjs')
-  db.openDb() // db2 = 数据库实例（仅用于 prepare 等原生调用）
-  db.upsertEntry({ fp: 'r1', layer: 'longterm', fragment_type: 'fact', kind: '知识', text: '待删除记忆条目', weight: 10 })
-
-  const r = I.removeEntry('r1')
-  assert.equal(r.ok, true)
-  assert.ok(r.backup, '应返回备份路径')
-  assert.ok(fs.existsSync(r.backup), '备份 .db 文件存在')
-  assert.ok(db.listBackups().length >= 1, '备份列表非空')
-  assert.equal(db.getByFp('r1'), undefined, '条目已从 SQLite 删除')
-  assert.ok(I.removeEntry('nope').ok === false, '不存在的 fp 返回失败')
-})
-
-// ============================================================================
 // 19. 记忆类别与来源（v0.6.1：memory_class / source_ref，建议≠决定）
 // ============================================================================
 

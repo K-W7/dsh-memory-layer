@@ -31,6 +31,9 @@ function ageDays(ts, now) {
 
 function logPath() { return path.join(MEMORY_ROOT, 'compact.log') }
 
+/** dump 导出保留份数（超出从最旧开始删） */
+export const MAX_DUMPS = 10
+
 function appendLog(lines) {
   if (!lines.length) return
   try {
@@ -39,7 +42,7 @@ function appendLog(lines) {
   } catch { /* 日志失败不影响清理结果 */ }
 }
 
-/** 执行五条规则。dryRun=true 只算不落库、不写日志 */
+/** 执行五条规则。dryRun=true 只算不落库、不写日志。写库路径不产生备份副本（见函数尾部说明） */
 export function compact({ now = new Date(), dryRun = false, rules = RULES } = {}) {
   const all = db.allEntries()
   const log = []
@@ -54,7 +57,11 @@ export function compact({ now = new Date(), dryRun = false, rules = RULES } = {}
       skippedPinned++
       continue
     }
-    const used = e.last_accessed || e.created_at
+    // v0.11：判据改用 last_used（**真实被使用**）而非 last_accessed。
+    // last_accessed 由"被注入"推进，而触发召回每次组装提示词都会注入一次 →
+    // 只要命中过一次就天天刷新，30/90 天规则形同虚设。真实使用只来自
+    // query 关键词命中与 memory action=used。
+    const used = e.last_used || e.created_at
     const age = ageDays(used, now)
     const hits = Number(e.hits || 0)
     const mtype = e.mtype || 'fact'
@@ -77,8 +84,12 @@ export function compact({ now = new Date(), dryRun = false, rules = RULES } = {}
     }
     // 规则 4：error / decision 永不自动淘汰（显式标记已解决由使用者 update 处理）
   }
+  // 口径统一：**任何写库路径都不自动生成备份副本**（compact / purge / 指纹迁移一致）。
+  // 理由：compact 只是把 status 改成 deleted，行还在库里，`restore` 能直接翻回来，
+  // 备份对它是纯冗余；而唯一真删库的 purge 恰恰不能备份（备份会把该消失的内容留下）。
+  // 需要事前快照就手工 `/memory dump` 或自己拷库——插件不替使用者做这件事。
   if (!dryRun) appendLog(log)
-  return { scanned: all.length, tombstoned, decayed, skippedPinned, dryRun, log }
+  return { scanned: all.length, tombstoned, decayed, skippedPinned, dryRun, backup: null, log }
 }
 
 /** 可读导出（dump）：把活跃记忆按类型写一份 Markdown，返回文件路径与计数 */
@@ -105,5 +116,10 @@ export function dump({ dir = MEMORY_ROOT, now = new Date() } = {}) {
   const file = path.join(dir, `dump-${now.toISOString().slice(0, 19).replace(/[:T]/g, '')}.md`)
   if (dir === MEMORY_ROOT) fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(file, lines.join('\n'), 'utf-8')
+  // v0.11：dump 文件轮转——旧实现每次导出都留一个新 md、从不清理，久了会堆一目录。
+  try {
+    const dumps = fs.readdirSync(dir).filter((f) => /^dump-.*\.md$/.test(f)).sort()
+    while (dumps.length > MAX_DUMPS) fs.unlinkSync(path.join(dir, dumps.shift()))
+  } catch { /* 清理失败不影响导出结果 */ }
   return { ok: true, file, total: all.length, byType: Object.fromEntries(Object.entries(byType).map(([k, v]) => [k, v.length])), chains: chains.length }
 }

@@ -22,8 +22,9 @@ dsh-memory-layer is **local-first**:
 
 | Version | Supported |
 |---------|-----------|
-| 0.9.x   | ✅ |
+| 0.11.x  | ✅         |
 
-## Audit
+## Deletion and auditability
 
-Every memory write is recorded in `audit.log` under the memory root, so all writes are traceable.
+There is no separate audit log: every memory is a row in the local SQLite database, and deletions leave
+tombstones (`status = deleted`) that `restore` can revive. `purge` is the only irreversible operation.

@@ -17,7 +17,7 @@
 // ============================================================================
 
 import * as db from './db.mjs'
-import { CFG, prefsText,  } from './shared.mjs'
+import { CFG } from './shared.mjs'
 import { entryStatus, consolidateHits } from './store.mjs'
 
 // ---------- 纯 JS 分词与词频余弦（聚类用；无外部依赖） ----------
@@ -33,18 +33,6 @@ export function tokenize(s) {
     if (w.length > 1) tokens.push(w)
   }
   return tokens
-}
-
-/** 词频 Map 之间的余弦相似度（输入为 Map<token, weight>） */
-export function cosine(a, b) {
-  let dot = 0, na = 0, nb = 0
-  for (const [t, w] of a) {
-    dot += w * (b.get(t) || 0)
-    na += w * w
-  }
-  for (const [, w] of b) nb += w * w
-  if (!na || !nb) return 0
-  return dot / (Math.sqrt(na) * Math.sqrt(nb))
 }
 
 // ---------- 确定性相关度检索（原 embed.mjs 的 exact 分支，迁入本层） ----------
@@ -107,7 +95,7 @@ export function exactSearch(query, entries, topN = 10, minWeight = 0.1, { weight
   const scored = []
   for (const entry of entries) {
     if (entry.weight < minWeight) continue
-    if (entry.status === 'archived') continue
+    // 状态过滤已由 queryEntries 统一完成（此处不再重复判断 archived，否则 includeArchived 失效）
     if (q && !probeText(entry).includes(q)) continue
     const { relevance } = exactRelevance(q, entry)
     const w = Math.min(Number(entry.weight) || 0, cap)
@@ -132,10 +120,19 @@ export async function queryEntries(query, limit = CFG.maxQueryResults, opts = {}
   const fragmentTypes = Array.isArray(opts.fragmentTypes) && opts.fragmentTypes.length ? new Set(opts.fragmentTypes) : null
   const includeArchived = opts.includeArchived === true
   const layer = opts.layer || undefined
-  const prefsTextStr = prefsText()
+
+  // v0.11：prefsText() 的结果被传给 entryStatus(e, prefsTextStr) 作第二参数，
+  // 而 entryStatus 的签名只接一个参数——每次 query/list 都白跑一次全表 preference 查询。
+  // 直接删掉这个死参数。
 
   const ql = (query || '').toLowerCase()
   let entries = db.allEntries({ includeArchived })
+  // v0.11：状态过滤统一在这里做完，下游（exactSearch + 保底补入）不再各判一次。
+  // 旧实现把状态判断散在两处且口径不一致：exactSearch 只跳过 archived，**保底补入循环
+  // 完全不过滤**，于是 includeArchived=true 时已删除的墓碑条目会被返回给模型——
+  // 已删除的记忆重新进入上下文，既违反直觉也是隐私泄漏。
+  // 现在：墓碑（deleted）永不参与检索；archived 仅在显式 includeArchived 时可见。
+  entries = entries.filter((e) => (e.status === 'active' || (includeArchived && e.status === 'archived')))
   if (layer) entries = entries.filter((e) => e.layer === layer)
   if (projectId) entries = entries.filter((e) => e.project_id === projectId)
   if (fragmentTypes) entries = entries.filter((e) => fragmentTypes.has(e.fragment_type))
@@ -155,7 +152,7 @@ export async function queryEntries(query, limit = CFG.maxQueryResults, opts = {}
   for (const r of results) {
     const e = r.entry
     if (!e) continue
-    out.push({ layer: e.layer, fp: e.fp, text: e.text, weight: e.weight, score: r.score, fragment_type: e.fragment_type, memory_class: e.memory_class, source_ref: e.source_ref, created_at: e.created_at, status: entryStatus(e, prefsTextStr), kind: e.kind, mode: e.mode, hits: e.hits, pinned: !!e.pinned, ts: e.created_at })
+    out.push({ layer: e.layer, fp: e.fp, text: e.text, weight: e.weight, score: r.score, fragment_type: e.fragment_type, memory_class: e.memory_class, source_ref: e.source_ref, created_at: e.created_at, status: entryStatus(e), kind: e.kind, mode: e.mode, hits: e.hits, pinned: !!e.pinned, ts: e.created_at })
     if (ql && kwHits.has(e.fp)) hitFps.add(e.fp) // 只给真实关键词命中加固
   }
   // 精确关键词命中未进 top-N 的也补入（保底不丢）
@@ -163,15 +160,14 @@ export async function queryEntries(query, limit = CFG.maxQueryResults, opts = {}
     const inOut = new Set(out.map((o) => o.fp))
     for (const e of entries) {
       if (kwHits.has(e.fp) && !inOut.has(e.fp) && out.length < limit) {
-        out.push({ layer: e.layer, fp: e.fp, text: e.text, weight: e.weight, memory_class: e.memory_class, source_ref: e.source_ref, status: entryStatus(e, prefsTextStr), fragment_type: e.fragment_type, kind: e.kind, mode: e.mode, hits: e.hits, pinned: !!e.pinned, ts: e.created_at, created_at: e.created_at })
+        out.push({ layer: e.layer, fp: e.fp, text: e.text, weight: e.weight, memory_class: e.memory_class, source_ref: e.source_ref, status: entryStatus(e), fragment_type: e.fragment_type, kind: e.kind, mode: e.mode, hits: e.hits, pinned: !!e.pinned, ts: e.created_at, created_at: e.created_at })
         inOut.add(e.fp)
       }
     }
   }
-  // 用进废退：带关键词的真实召回才巩固（list 浏览不计）
-  if (ql && hitFps.size) {
-    const files = consolidateHits(hitFps)
-  }
+  // 用进废退：带关键词的真实召回才巩固（list 浏览不计）——这算「真实使用」，
+  // 与触发召回的「被注入」区分开：只有这里和 memory action=used 会推进 last_used。
+  if (ql && hitFps.size) consolidateHits(hitFps)
   // DSH 0.1.2-rc.1 起工具返回值须为 lossless JSON（dsh-tools 校验拒绝 undefined/NaN/-0）
   for (const it of out) for (const k of Object.keys(it)) if (it[k] === undefined || (typeof it[k] === 'number' && !Number.isFinite(it[k]))) it[k] = null
   return out.slice(0, limit)

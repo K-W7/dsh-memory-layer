@@ -8,7 +8,8 @@
 //   - 向量：vector BLOB（Float32Array 序列化）随行存储 + JS 侧暴力 cosine
 //     （个人规模 ≤10 万条下与 HNSW 等效，零原生依赖——文档 §4.4 延迟目标内）
 //   - 断点续跑：compact 检查点存 meta 表（文档 P0-002）
-//   - 数据安全：compact 前自动备份 .db 副本，保留最近 7 次（文档 §4.5）
+//   - 数据安全：**插件的写库路径不自动生成 .db 副本**（compact 只改 status，墓碑可 restore；
+//     purge 是唯一真删，恰恰不该留副本）。`backupDb()` 保留为手工/工具入口，restore 仍读历史备份。
 //
 // 迁移：首次启动自动把现有 Markdown（hot/projects/longterm/preferences）
 // 导入 SQLite（文档 §4.5 export/导入精神）；Markdown 原文件保留为只读备份。
@@ -103,7 +104,7 @@ function migrateSchema(db) {
   `)
   // v0.6.1：记忆来源与语义类别（评审建议 source_ref + memory_class）——
   // 旧库用 ALTER TABLE 补列（列已存在时 ADD COLUMN 抛错，静默忽略）
-  for (const ddl of ['source_ref TEXT', 'memory_class TEXT', 'realm TEXT', 'mtype TEXT', 'trigger TEXT', 'mkey TEXT']) {
+  for (const ddl of ['source_ref TEXT', 'memory_class TEXT', 'realm TEXT', 'mtype TEXT', 'trigger TEXT', 'mkey TEXT', 'last_used TEXT']) {
     try { db.exec(`ALTER TABLE entries ADD COLUMN ${ddl}`) } catch { /* 列已存在 */ }
   }
   // v0.10.0：新列索引必须在 ALTER 之后建（旧库先加列，否则 CREATE INDEX 找不到列）
@@ -134,6 +135,7 @@ function toRow(e) {
     pin_reason: e.pin_reason ?? null,
     created_at: e.created_at ?? null,
     last_accessed: e.last_accessed ?? null,
+    last_used: e.last_used ?? null,
     status: e.status || 'active',
     vector: e.vector ?? null,
     source_ref: e.source_ref ?? null,
@@ -165,6 +167,7 @@ function fromRow(r) {
     pin_reason: r.pin_reason ?? undefined,
     created_at: r.created_at ?? undefined,
     last_accessed: r.last_accessed ?? undefined,
+    last_used: r.last_used ?? undefined,
     status: r.status,
     source_ref: r.source_ref ?? undefined,
     memory_class: r.memory_class ?? undefined,
@@ -202,6 +205,7 @@ export function upsertEntry(e) {
       pinned: e.pinned !== undefined ? (e.pinned ? 1 : 0) : existing.pinned,
       pin_reason: e.pin_reason !== undefined ? e.pin_reason : existing.pin_reason,
       last_accessed: e.last_accessed !== undefined ? e.last_accessed : existing.last_accessed,
+      last_used: e.last_used !== undefined ? e.last_used : existing.last_used,
       status: keep(e.status, existing.status),
       vector: e.vector !== undefined ? e.vector : existing.vector,
       source_ref: e.source_ref !== undefined ? e.source_ref : existing.source_ref,
@@ -214,12 +218,12 @@ export function upsertEntry(e) {
     db.prepare(`UPDATE entries SET
       layer=?, project_id=?, project_name=?, fragment_type=?, kind=?, mode=?,
       summary=?, text=?, entities=?, weight=?, hits=?, pinned=?, pin_reason=?,
-      last_accessed=?, status=?, vector=?, source_ref=?, memory_class=?,
+      last_accessed=?, last_used=?, status=?, vector=?, source_ref=?, memory_class=?,
       realm=?, mtype=?, trigger=?, mkey=?
       WHERE fp = ?`).run(
       m.layer, m.project_id, m.project_name, m.fragment_type, m.kind, m.mode,
       m.summary, m.text, m.entities, m.weight, m.hits, m.pinned, m.pin_reason,
-      m.last_accessed, m.status, m.vector, m.source_ref, m.memory_class,
+      m.last_accessed, m.last_used, m.status, m.vector, m.source_ref, m.memory_class,
       m.realm, m.mtype, m.trigger, m.mkey, r.fp,
     )
     return existing.entry_id
@@ -227,11 +231,11 @@ export function upsertEntry(e) {
   db.prepare(`INSERT INTO entries
     (entry_id, fp, layer, project_id, project_name, fragment_type, kind, mode,
      summary, text, entities, weight, hits, pinned, pin_reason, created_at,
-     last_accessed, status, vector, source_ref, memory_class, realm, mtype, trigger, mkey)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+     last_accessed, last_used, status, vector, source_ref, memory_class, realm, mtype, trigger, mkey)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     r.entry_id, r.fp, r.layer, r.project_id, r.project_name, r.fragment_type, r.kind, r.mode,
     r.summary, r.text, r.entities, r.weight, r.hits, r.pinned, r.pin_reason,
-    r.created_at ?? isoNow(), r.last_accessed, r.status, r.vector, r.source_ref, r.memory_class,
+    r.created_at ?? isoNow(), r.last_accessed, r.last_used, r.status, r.vector, r.source_ref, r.memory_class,
     r.realm, r.mtype, r.trigger, r.mkey,
   )
   return r.entry_id
@@ -261,14 +265,44 @@ export function listEntries({ projectId, layer, fragmentType, status = 'active',
   return db.prepare(sql).all(...args).map(fromRow)
 }
 
-/** 统计：总量/锁定/分层/状态分布 */
+/**
+ * 统计：总量/锁定/分层/状态分布。
+ * v0.11：total 与 pinned 只数 active —— 旧实现把墓碑（deleted）和归档一起算进总数，
+ * 状态页显示的"总记忆数"虚高（实测 3 条里 1 墓碑 1 归档仍显示 3）。
+ * 墓碑/归档数量改由 status 分布单独呈现，不再混进总数。
+ */
 export function stats() {
   const db = openDb()
-  const total = db.prepare('SELECT COUNT(*) c FROM entries').get().c
-  const pinned = db.prepare('SELECT COUNT(*) c FROM entries WHERE pinned = 1').get().c
-  const byLayer = Object.fromEntries(db.prepare('SELECT layer, COUNT(*) c FROM entries GROUP BY layer').all().map((r) => [r.layer, r.c]))
+  const total = db.prepare("SELECT COUNT(*) c FROM entries WHERE status = 'active'").get().c
+  const pinned = db.prepare("SELECT COUNT(*) c FROM entries WHERE pinned = 1 AND status = 'active'").get().c
+  const byLayer = Object.fromEntries(db.prepare("SELECT layer, COUNT(*) c FROM entries WHERE status = 'active' GROUP BY layer").all().map((r) => [r.layer, r.c]))
   const byStatus = Object.fromEntries(db.prepare('SELECT status, COUNT(*) c FROM entries GROUP BY status').all().map((r) => [r.status, r.c]))
   return { total, pinned, layers: byLayer, status: byStatus, dbPath: dbPath() }
+}
+
+/**
+ * 健康度（`/memory stats`）：回答"我存的记忆有多少是活的"。
+ * triggerCoverage 是最有用的一项——没有 trigger 的条目**永远不会被触发式召回命中**，
+ * 只能靠常驻快照出场；这个比例越高，说明"主动想起"的能力越弱。
+ */
+export function health() {
+  const db = openDb()
+  const q = (sql) => db.prepare(sql).get().c
+  const active = q("SELECT COUNT(*) c FROM entries WHERE status = 'active'")
+  const noTrigger = q("SELECT COUNT(*) c FROM entries WHERE status = 'active' AND (trigger IS NULL OR TRIM(trigger) = '')")
+  const byType = Object.fromEntries(db.prepare("SELECT COALESCE(mtype,'fact') k, COUNT(*) c FROM entries WHERE status = 'active' GROUP BY k").all().map((r) => [r.k, r.c]))
+  const byRealm = Object.fromEntries(db.prepare("SELECT COALESCE(realm,'user') k, COUNT(*) c FROM entries WHERE status = 'active' GROUP BY k ORDER BY c DESC").all().map((r) => [r.k, r.c]))
+  return {
+    active,
+    pinned: q("SELECT COUNT(*) c FROM entries WHERE pinned = 1 AND status = 'active'"),
+    tombstoned: q("SELECT COUNT(*) c FROM entries WHERE status = 'deleted'"),
+    archived: q("SELECT COUNT(*) c FROM entries WHERE status = 'archived'"),
+    noTrigger,
+    triggerCoverage: active ? Math.round((active - noTrigger) * 1000 / active) / 10 : 0,
+    byType,
+    byRealm,
+    chains: q('SELECT COUNT(*) c FROM chains'),
+  }
 }
 
 /** 按指纹删除（物理）。v0.8.0：不再连带删除审计行——删条目不等于抹掉历史（审计是追溯链） */
@@ -280,15 +314,24 @@ export function removeByFp(fp) {
   return true
 }
 
-/** 更新权重/命中/访问时间（回忆强化） */
-export function touchEntry(fp, { weightDelta = 0, hitsDelta = 0, accessed = false } = {}) {
+/**
+ * 更新权重/命中/访问时间。
+ *
+ * 两个时间语义必须分开（v0.11）：
+ *   accessed=true → 刷新 last_accessed（**被注入/被看到**，仅用于召回排序）
+ *   used=true     → 刷新 last_used（**真实被使用**，清理规则"多久没人用"的唯一判据）
+ * 旧实现两者混为一谈：触发召回每次组装提示词都 hits+1 并刷新同一列，于是只要被想起过
+ * 一次就永远"最近使用过"，compact 的 30/90 天规则事实上永不触发（自反馈污染）。
+ */
+export function touchEntry(fp, { weightDelta = 0, hitsDelta = 0, accessed = false, used = false } = {}) {
   const db = openDb()
   const e = getByFp(fp)
   if (!e) return
   const w = Math.min(20, Math.max(0.1, e.weight + weightDelta))
   const h = e.hits + hitsDelta
-  db.prepare('UPDATE entries SET weight = ?, hits = ?, last_accessed = ? WHERE fp = ?')
-    .run(w, h, accessed ? isoNow() : (e.last_accessed ?? null), fp)
+  const now = isoNow()
+  db.prepare('UPDATE entries SET weight = ?, hits = ?, last_accessed = ?, last_used = ? WHERE fp = ?')
+    .run(w, h, accessed ? now : (e.last_accessed ?? null), used ? now : (e.last_used ?? null), fp)
 }
 
 /** 设置/解除记忆钉。v0.8.0：不再把 weight 清零（旧实现 pinned 时写 weight=1 →
@@ -311,7 +354,7 @@ export function allEntries({ includeArchived = false } = {}) {
   return db.prepare(sql).all().map(fromRow)
 }
 
-// ---------- 向量：已于 v0.9.0 随语义检索一起移除 ----------
+// ---------- 向量：已于 v0.9.0 随语义检索一起移除（v0.11 注：下列描述已失效，仅为保留历史上下文） ----------
 // `entries.vector` 列保留在 schema 中仅为兼容既有数据库（避免破坏性重建），
 // 运行期不再读写；相关 API（setVector/setVectorsBatch/entriesWithVectors/vectorCount）已删除。
 
@@ -335,7 +378,8 @@ export function metaSet(k, v) {
 
 // ---------- 备份 / 恢复 ----------
 
-/** compact 前自动备份 .db（保留最近 MAX_BACKUPS 次） */
+/** 全库快照：**手工/工具入口**（保留最近 MAX_BACKUPS 次）。插件自身的 compact / purge /
+ *  指纹迁移都不再自动调用它——删除是墓碑、可 restore，purge 反而不能留副本。 */
 export function backupDb() {
   const db = openDb()
   // v0.8.0：checkpoint 结果要检查——busy≠0 说明还有读者/写者，TRUNCATE 没能把 WAL 全部并回主库，
@@ -454,9 +498,14 @@ export function byTrigger(triggers, { realm } = {}) {
   return rows.map(fromRow).sort((a, b) => (b.realm === realm) - (a.realm === realm))
 }
 
-/** 同 trigger 的活跃条目数（>3 触发 workflow 升级） */
-export function countByTrigger(trigger) {
-  const r = openDb().prepare("SELECT COUNT(*) c FROM entries WHERE trigger = ? AND status = 'active'").get(trigger)
+/** 同 trigger 的活跃条目数（>3 触发 workflow 升级）。
+ *  v0.11：支持按 realm 计数，与 trigger_counts 的 (trigger, realm) 口径对齐——
+ *  旧实现只按 trigger 全库数，升级判据与计数表口径不一致。不传 realm 时保持全库语义。 */
+export function countByTrigger(trigger, realm) {
+  const db = openDb()
+  const r = realm
+    ? db.prepare("SELECT COUNT(*) c FROM entries WHERE trigger = ? AND realm = ? AND status = 'active'").get(trigger, realm)
+    : db.prepare("SELECT COUNT(*) c FROM entries WHERE trigger = ? AND status = 'active'").get(trigger)
   return r ? r.c : 0
 }
 

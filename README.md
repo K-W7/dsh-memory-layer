@@ -2,7 +2,7 @@
 
 > **给 DeepSeek Harness 的记忆层**：记住你的偏好和决定，换个会话它自己会想起来；数据只在本机，随时能查能改。
 
-**v0.10.2** · MIT License · DSH 0.2.x（`>=0.2.0-rc.2 <0.3.0-0`，0.2.1-rc.3 桌面版实测）· Node ≥ 22.19.0
+**v0.11.2** · MIT License · DSH 0.2.x（`>=0.2.0-rc.2 <0.3.0-0`，0.2.1-rc.3 桌面版实测）· Node ≥ 22.19.0
 
 ---
 
@@ -26,10 +26,14 @@
 | `trigger` | 触发信号串（见下） |
 | `mkey` | 同键覆盖用的主题键 |
 | `text` | 正文 |
-| `created_at` / `last_accessed` / `hits` | 生命周期：写入时间 / 最近使用 / 使用次数 |
-| `status` | `active` / `archived` / `deleted`（删除是**墓碑**，不物理删） |
+| `created_at` / `last_accessed` / `last_used` / `hits` | 生命周期：写入时间 / 最近**被注入** / 最近**真实使用** / 真实使用次数 |
+| `status` | `active` / `archived` / `deleted`（`remove` 是**墓碑**，不物理删；只有 `purge` 不可逆） |
 
 另有两张辅助表：`chains`（工作流链）、`trigger_counts`（触发次数，用于工作流升级）。
+
+> v0.11：`last_accessed`（被看到）与 `last_used`（真被用上）必须分开。
+> 混为一谈时，触发召回每组装一次提示词就把命中条目刷新成"刚用过"，
+> 清理规则的 30/90 天判据会被自己喂饱、永不触发。
 
 ### 2. 召回层：触发信号驱动
 
@@ -40,18 +44,34 @@
   - `file:<文件名>` —— 例如 `file:package.json`
   - `tool:<工具名>` —— 例如 `tool:pwsh`
   - `err:<错误代号>` —— 例如 `err:MODULE_NOT_FOUND`
-- 命中即注入，排序 **workflow > error > decision > fact**，同类型按最近使用时间；命中工作流链则**整条链**一起注入。
+- 命中即注入，排序 **workflow > error > decision > fact**，同类型按最近访问；命中工作流链则**整条链**一起注入。
 - **注入预算**：每次最多 8 条、最多 1200 字符；没命中就一个字都不注入（不占 token）。
+- **偏好/决定通道**（v0.11）：触发串只能从文件名/错误代号里提取，而"偏好/决定"是纯自然语言
+  （实测 8 条典型偏好里 6 条没有任何 trigger）。给它们一条独立小预算（默认 ≤3 条 / ≤400 字符），
+  不与触发召回抢 1200 字符。
+- **冷启动兜底**（v0.11）：库还很小、还没攒出 trigger 关联时，零命中也不至于颗粒无收
+  （回落注入最近写入的几条；库一大就自动让位给触发召回）。
+
+### 2.5 注入 ≠ 使用（v0.11）
+
+被注入只刷新 `last_accessed`；只有下面两种情况才算**真实使用**、推进 `hits` 与 `last_used`：
+
+- `memory action=query` 的关键词命中；
+- 显式 `memory action=used fp=<指纹>`。
+
+清理规则只认真实使用。这样"被想起过"不会阻止一条记忆最终被淘汰。
 
 ### 3. 清理层：五条可解释规则
 
 `/memory compact` 执行，每次淘汰都写 `compact.log`：
 
-1. 同 `realm + type + key` 的新记忆覆盖旧记忆（旧条目标墓碑）——写在写入路径上；
-2. `fact`：超过 30 天没人用（使用次数 ≤1）→ 进墓碑；
-3. `workflow` / `error` / `decision`：不设有效期；超过 90 天没人用 → 权重减半；
+1. 同 `realm + type + key` 的新记忆覆盖旧记忆（旧条目标墓碑）——写在写入路径上（**全等**比较，不做前缀匹配）；
+2. `fact`：**真实使用**超过 30 天没发生过（使用次数 ≤1）→ 进墓碑；
+3. `workflow` / `error` / `decision`：不设有效期；**真实使用**超过 90 天前 → 权重减半；
 4. `error` 与 `decision` **永不自动删除**；
 5. 每条淘汰/降权都记 `compact.log`（时间 · 指纹 · 命中规则 · 摘要）。
+
+锁定（pinned）的条目豁免全部规则；`compact` 只把 `status` 改成 `deleted`（墓碑，`restore` 能翻回来），所以**写库路径不产生备份副本**——需要事前快照请自己 `dump` 或拷库。
 
 ### 4. 适配层：工作流从重复里自己长出来
 
@@ -91,21 +111,33 @@ dsh plugin --profile desktop add link:./dsh-memory-layer
 
 | action | 说明 |
 |---|---|
-| `add` | 写入一条记忆（`text` 必填；`track=user|agent`；`source` 记来源） |
-| `query` | 关键词查询（`text`/`topK`/`fragmentTypes`/`includeArchived`） |
-| `list` / `update` / `remove` / `restore` / `pin` / `unpin` | 浏览 / 改 / 删（墓碑）/ 回滚 / 锁定 / 解锁 |
-| `compact` | 按五条规则清理（`dryRun=true` 只预览） |
-| `dump` | 导出人类可读 Markdown（含工作流链） |
+| `add` | 写入一条记忆（`text` 必填；`track=user|agent`；`source` 记来源；realm 由会话工作目录推断） |
+| `query` | 关键词查询（`text`/`topK`/`fragmentTypes`/`includeArchived`）；**关键词命中记一次真实使用** |
+| `used` | 标记"这条刚才真的用上了"（推进 `hits` 与 `last_used`，影响清理规则） |
+| `list` / `update` | 浏览 / 改 |
+| `remove` | 标墓碑（行还在库里，`restore` 可回滚） |
+| `purge` | **物理删除**（不可逆；不落备份副本——备份会把该消失的内容留在同一台机器上）——只给误存密钥这类场景 |
+| `restore` / `pin` / `unpin` | 回滚 / 锁定 / 解锁 |
+| `compact` | 按五条规则清理（`dryRun=true` 只预览；实跑只改 `status`，不备份） |
+| `dump` | 导出人类可读 Markdown（含工作流链；保留最近 10 份） |
 
 还有一个 `memory_recall` 工具，用于"你还记得…吗"式的显式召回。
 
 ### 命令 `/memory`
 
 ```
-/memory list | query <词> | add <内容> | edit <fp> <新内容> | remove <fp> | undo <fp>
-/memory pin <fp> | unpin <fp> | entries [词]
-/memory compact [--dry-run] | dump
+/memory list | query <词> | add <内容> | edit <fp> <新内容> | entries [词]
+/memory remove <fp> | purge <fp> | undo <fp> | unarchive <fp> | used <fp>
+/memory pin <fp> | unpin <fp>
+/memory stats | why <fp> | preview
+/memory compact [--dry-run] | dump | help
 ```
+
+- **`stats`**：健康度——活跃条数、墓碑/归档数、类型与 realm 分布，以及 **trigger 覆盖率**
+  （有多少记忆没有任何触发串 = 永远不会被主动想起，只能靠偏好通道或常驻快照出场）。
+- **`why <fp>`**：这条记忆为什么（不）会被注入——命中了哪个触发串、realm 是否匹配、优先级、
+  真实使用次数。
+- **`preview`**：预览"如果现在组装提示词，会注入什么"（含偏好通道、触发命中、冷启动三段与预算占用）。
 
 ### 写入审批
 
@@ -113,14 +145,19 @@ dsh plugin --profile desktop add link:./dsh-memory-layer
 
 ## 数据与隐私
 
-- 全部本地：零网络请求、零外部 API、零遥测。
+- 全部本地：零外部请求、零外部 API、零遥测。
 - 数据库：`<DSH_BIOMEMORY_DIR || ~/.dsh/biomemory>/biomemory.db`（SQLite，WAL）。
-- 删除是墓碑（可恢复），`compact` 也只在库内改状态；需要真备份时 `dump` 出 Markdown。
+- 删除是墓碑（可恢复），`compact` 也只在库内改状态；**写库路径一律不产生备份副本**（`purge` 尤其不能留副本），需要快照就 `dump` 出 Markdown 或自己拷库。
 - 环境变量：`DSH_BIOMEMORY_DIR`（数据目录）、`DSH_MEMORY_ROOT`（Markdown 备份/日志目录）。
+- **配置目录说明**：配置文件在 `<DSH_MEMORY_ROOT || ~/.dsh/memory>/biomemory.config.json`
+  （v0.11 修正：旧文档写成 `~/.dsh/biomemory/`，与实现不符——库在 `biomemory/`、配置与导出在 `memory/`）。
+- **本地 HTTP 端点**（宿主 webServer 存在时注册 `/biomemory/api`）：默认只接受本机来源，
+  跨站请求一律 403；必要时可用 `DSH_MEMORY_API_ORIGINS` 放开指定 Origin，
+  或 `DSH_MEMORY_API_NOAUTH=1` 关闭校验（不建议）。
 
 ## 配置
 
-`~/.dsh/biomemory/biomemory.config.json`（或 bundle config）可覆盖：
+`<DSH_MEMORY_ROOT || ~/.dsh/memory>/biomemory.config.json`（或 bundle config）可覆盖：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -128,8 +165,13 @@ dsh plugin --profile desktop add link:./dsh-memory-layer
 | `nearDuplicateAction` | merge | 命中近重复时合并 / `skip` 只提示 |
 | `approvalFallback` | deny | 审批不可用时拒绝 / `auto` 自动保存 |
 | `decayThreshold` | 3 | 状态页"低权重待处理"的阈值 |
-| `hotTokenLimit` | 5000 | 冻结快照注入的 token 上限 |
+| `hotTokenLimit` | 2000 | 常驻快照注入的 token 上限（v0.11：5000→2000，让触发召回成为主通道） |
 | `maxQueryResults` | 20 | 查询返回上限 |
+| `weightCap` | 20 | 权重上限（防膨胀） |
+| `sinkWindowMinutes` | 5 | 轮次结束后"请沉淀"提示的有效窗口（分钟） |
+| `decisionChannelMax` | 3 | 偏好/决定通道每轮最多注入条数（0=关闭） |
+| `decisionChannelChars` | 400 | 偏好/决定通道每轮字符预算（0=关闭） |
+| `coldStartFallbackMax` | 3 | 冷启动兜底条数（0=关闭） |
 
 ## 设计上刻意不做的事
 
@@ -142,6 +184,9 @@ dsh plugin --profile desktop add link:./dsh-memory-layer
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| **v0.11.2** | 2026-10-31 | **按已发布的 0.11.1 回灌仓库 + 收口**：0.11.0/0.11.1 的源码树丢失，以 tgz 为准恢复模块（代码与 0.11.1 逐字节一致，功能无变更）；README 版本曝光、ARCHITECTURE 测试指向、SECURITY 支持版本与 audit.log 说明、CI Node 22.19 矩阵、.gitignore 白名单同步修正；删除 2 条 0.10 语义旧用例、同键覆盖用例改为全等键；删除 stale `pnpm-lock.yaml`。详见 `CHANGELOG.md` |
+| **v0.11.1** | 2026-10-28 | **写库不再自动备份 + 测试随包发布**：`compact` / `purge` / 指纹迁移口径统一为「不落备份副本」（墓碑可 `restore`，`purge` 反而不能留副本，`backupDb()` 降为手工入口）；`files` 补 `tests` 并新增 `tests/core.test.mjs`（零依赖，装完即可 `npm test`）。详见 `CHANGELOG.md` |
+| **v0.11.0** | 2026-10-27 | **数据正确性与可观测性**：修 `includeArchived` 会返回已删除墓碑条目；`remove` 改为真墓碑（物理删除收敛到 `purge`）；指纹改全文哈希（旧算法前 20 字撞车会静默丢记忆）+ 一次性重算迁移；同键覆盖改全等（前缀匹配会误墓碑）；注入与真实使用分开计数（`last_accessed` / `last_used`），清理规则不再被自反馈喂饱；写入路径按会话 cwd 推断 realm；沉淀状态与会话信号按会话分桶；本地 HTTP 端点加来源校验；`selfHeal` 不再抛出。**新增**：偏好/决定独立通道、冷启动兜底、`/memory stats`（含 trigger 覆盖率）/ `why` / `preview` / `used` / `purge` / `unarchive` / `help`、快照缓存、dump 轮转 |
 | **v0.10.2** | 2026-10-25 | 简介换成「记住偏好与决定、换会话自动带上」的说法，桌面版实测版本改 0.2.1-rc.3；功能无变更 |
 | **v0.10.1** | 2026-10-25 | 插件卡片文案重写：中英双语显示名与一句话简介（`locale` 的 `meta`），`description` 去掉版本号与功能罗列；功能无变更 |
 | **v0.10.0** | 2026-10-05 | **重构为「记忆层」**：新增触发式召回（`trigger` + `realm` + `mtype` + `mkey` 四列）、类型优先级排序、五条清理规则 + 墓碑 + `compact.log`、工作流从重复中升级并成链、注入预算（≤8 条 / ≤1200 字符）、`compact`/`dump`；**移除**记忆代谢（dream）、深度反思（reflect）、冲突裁决、结构化审计与自动 Markdown 镜像 |

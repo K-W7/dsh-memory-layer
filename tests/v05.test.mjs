@@ -163,22 +163,6 @@ test('backupDb：创建 .db 副本并保留最近 7 次', () => {
 // ============================================================================
 
 
-test('restoreEntry：从备份回滚单条目，保留元数据', () => {
-  db.upsertEntry({ fp: 'rf-restore', layer: 'hot/behavior', kind: '行为', text: '待回滚的行为记忆', weight: 7, pinned: 1, status: 'active' })
-  const rm = I.removeEntry('rf-restore')
-  assert.equal(rm.ok, true)
-  assert.equal(db.getByFp('rf-restore'), undefined, '已删除')
-  const rs = I.restoreEntry('rf-restore')
-  assert.equal(rs.ok, true, '可从备份回滚')
-  const e = db.getByFp('rf-restore')
-  assert.equal(e.text, '待回滚的行为记忆', '文本恢复')
-  assert.equal(e.weight, 7, '权重恢复')
-  assert.equal(e.pinned, true, '锁定恢复')
-  // 未删除的条目不可恢复（防误覆盖）
-  const dup = I.restoreEntry('rf-restore')
-  assert.equal(dup.ok, false, '已存在时不重复恢复')
-})
-
 test('restoreEntry：墓碑（deleted）可直接复活，不报「仍存在」（v0.10.1）', () => {
   db.upsertEntry({ fp: 'rf-tomb', layer: 'longterm', kind: '知识', text: '被 compact 判了墓碑的条目', weight: 10, pinned: 1, status: 'active' })
   db.setStatus('rf-tomb', 'deleted')

@@ -19,8 +19,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # node:sqlite 的稳定实现自 Node 24 起；engines 下限 22.19.0 待补测后再纳入矩阵
-        node: ['24.x']
+        # engines 下限 22.19.0 纳入矩阵；node:sqlite 自 Node 22.13 起无需 flag
+        node: ['22.19.x', '24.x']
     name: Node ${{ matrix.node }}
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +30,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      # --ignore-scripts：测试不加载本地嵌入模型，跳过 onnxruntime/sharp 原生下载
+      # --ignore-scripts：零运行时依赖；忽略第三方安装脚本
       - name: 安装依赖
         run: npm ci --ignore-scripts --no-audit --no-fund
 

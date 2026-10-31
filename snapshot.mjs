@@ -57,7 +57,31 @@ function trimTextToTokens(text, maxTokens, title = null) {
   return out.join('\n')
 }
 
+// v0.11：快照缓存。systemPrompt.context 传的是求值函数，**每组装一次提示词就跑一次**，
+// 而 renderSnapshot 会全表扫描 + 逐行 estimateTokens（记忆多了是每轮的固定开销）。
+// 缓存键只取"真正会影响输出"的聚合值（条目数 / 锁定数 / 最新写入时间 / 权重总和 / 预算配置），
+// 不含 last_accessed——它会被触发召回的注入频繁刷新，用它做键会让缓存形同虚设。
+let _snapshotCache = { key: '', text: '' }
+function snapshotCacheKey() {
+  try {
+    const r = db.openDb().prepare(
+      "SELECT COUNT(*) n, COUNT(CASE WHEN pinned = 1 THEN 1 END) p, COALESCE(MAX(created_at), '') m, COALESCE(SUM(weight), 0) w FROM entries WHERE status = 'active'",
+    ).get()
+    return `${r.n}|${r.p}|${r.m}|${r.w}|${CFG.hotTokenLimit}|${CFG.decayThreshold}`
+  } catch {
+    return ''
+  }
+}
+
 export function renderSnapshot() {
+  const cacheKey = snapshotCacheKey()
+  if (cacheKey && _snapshotCache.key === cacheKey) return _snapshotCache.text
+  const text = computeSnapshot()
+  if (cacheKey) _snapshotCache = { key: cacheKey, text }
+  return text
+}
+
+function computeSnapshot() {
   const prefs = db.listEntries({ fragmentType: 'preference', status: 'active', limit: 200 })
     .map((e) => `- [${e.created_at ? String(e.created_at).slice(0, 10) : ''}]${e.memory_class ? `[${e.memory_class}]` : ''} ${e.text}`)
     .join('\n')
@@ -156,8 +180,8 @@ export function renderSnapshot() {
 export function sessionSummarySectionText() {
   // 无待沉淀标记 → 不注入
   if (!isSummaryPending()) return ''
-  // 距上次 turn/end 超过窗口（默认 60 分钟，v0.8.0 起可配；旧实现硬编码 5 分钟，
-  // 用户离开久一点提醒就被静默丢掉）→ 不再催促
+  // 距上次 turn/end 超过窗口（可配 sinkWindowMinutes；**默认 5 分钟**——旧注释写"默认 60 分钟"
+  // 与 DEFAULTS 不符）→ 不再催促，避免用户隔很久再发消息时被一条过期的提示打扰。
   const windowMs = Math.max(1, Number(CFG.sinkWindowMinutes) || 60) * 60 * 1000
   const last = getLastTurnEnd()
   if (last > 0 && Date.now() - last > windowMs) {

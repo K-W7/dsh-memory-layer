@@ -11,57 +11,116 @@
 //   session-state.mjs 会话沉淀状态
 //   db.mjs            SQLite 数据层
 //
-// 目标运行时：@deepseek-ai/dsh-* 0.1.x（host runtime 实测契约）。
+// 目标运行时：@deepseek-ai/dsh-* 0.2.x（v0.11 修正：旧注释写的是 0.1.x，与 package.json
+// 的 peerDependencies `>=0.2.0-rc.2 <0.3.0-0` 不符）。
 // ============================================================================
 
 import fs from 'node:fs'
 import path from 'node:path'
-import http from 'node:http'
-import os from 'node:os'
 import * as db from './db.mjs'
 
-// ---------- v0.6 架构升级：分组导入（shared/store/retrieve/meta/snapshot/gate） ----------
+// ---------- 分组导入（shared/store/retrieve/snapshot/gate/compact/recall） ----------
 import {
-  CFG, DEFAULTS, PATHS, getConfig, setConfig,
+  CFG, DEFAULTS, PATHS, setConfig,
   loadConfig, saveConfig,
-  ensureDirs, readFile, writeFile, appendFile, nowStamp, isoNow, tsToIso,
-  fingerprint, isImportant, estimateTokens,
-  zhBigrams, dbgLog, MEMORY_ROOT, prefsText,
+  ensureDirs, dbgLog, MEMORY_ROOT, projectRealm,
+  fingerprint, isImportant, estimateTokens, zhBigrams,
 } from './shared.mjs'
 import {
   parseEntryLine, formatEntryLine, readEntries, scanAllFiles,
-  migrateMarkdownToDb, writeEntry, setPin,
-  consolidateHits, removeEntry, restoreEntry, entryStatus, updateEntryText,
+  migrateMarkdownToDb, migrateFingerprints, writeEntry, setPin,
+  consolidateHits, removeEntry, purgeEntry, restoreEntry, entryStatus, updateEntryText,
+  markUsed, unarchiveEntry,
 } from './store.mjs'
 import { queryEntries, tokenize } from './retrieve.mjs'
 import { renderSnapshot, sessionSummarySectionText, handleSessionEvent } from './snapshot.mjs'
 import { gateWrite, selfHeal } from './gate.mjs'
 import { compact, dump } from './compact.mjs'
-import { recallBySignals } from './recall.mjs'
-import {
-  markSummaryPending, clearSummaryPending, isSummaryPending,
-  getLastTurnEnd, setLastTurnEnd,
-} from './session-state.mjs'
+import { recallBySignals, buildInjection, explain } from './recall.mjs'
+import { markSummaryPending, clearSummaryPending, isSummaryPending } from './session-state.mjs'
 
 export const inject = ['tools', 'systemPrompt']
 
-// ---------- v2：触发式召回的会话信号（项目路径 + 最近工具调用） ----------
-const SIGNAL = { cwd: '', toolCalls: [] }
+// ---------- 触发式召回的会话信号（工作目录 + 最近工具调用） ----------
+// v0.11：改为**按会话分桶**。旧实现是一个模块级单例，多会话并行时 A 会话打开的文件
+// 会被当成 B 会话的信号（cwd 还会被最后活跃的会话覆盖），召回结果互相串味。
+//
+// ⚠️ 宿主限制：systemPrompt.context 只给一个**无参**求值函数，拿不到当前 session，
+// 因此注入时只能用「最近活跃的那一个会话」的信号——这已比全局混合准确得多。
+// 若哪天宿主支持 text(session)，这里可以直接按 session 取桶。
+const SIGNALS = new Map() // sessionId -> { cwd, toolCalls }
+const MAX_TOOL_CALLS = 12
+let _activeSession = ''
+let _sawSessionEvent = false
+
+function sessionKeyOf(session) {
+  return String((session && (session.id ?? session.key)) || '_default')
+}
+
 function noteSignal(session, rawEvent) {
   try {
-    if (session && session.cwd) SIGNAL.cwd = session.cwd
+    const key = sessionKeyOf(session)
+    _activeSession = key
+    _sawSessionEvent = true
+    let s = SIGNALS.get(key)
+    if (!s) { s = { cwd: '', toolCalls: [] }; SIGNALS.set(key, s) }
+    if (session && session.cwd) s.cwd = session.cwd
     if (rawEvent && rawEvent.type === 'tool/call') {
-      SIGNAL.toolCalls.push({ name: rawEvent.name, arguments: rawEvent.arguments })
-      if (SIGNAL.toolCalls.length > 12) SIGNAL.toolCalls.splice(0, SIGNAL.toolCalls.length - 12)
+      s.toolCalls.push({ name: rawEvent.name, arguments: rawEvent.arguments })
+      if (s.toolCalls.length > MAX_TOOL_CALLS) s.toolCalls.splice(0, s.toolCalls.length - MAX_TOOL_CALLS)
     }
   } catch { /* 信号采集失败不影响主流程 */ }
 }
+
+function currentSignal() {
+  const s = SIGNALS.get(_activeSession)
+  return { cwd: (s && s.cwd) || '', toolCalls: (s && s.toolCalls) || [] }
+}
+
+/** 写入时推断 realm：优先用当前会话的工作目录（v0.11：旧实现写入路径从不落 realm，
+ *  于是全部记忆都是 'user'，README 宣称的 project 隔离维度实际不存在） */
+function realmFor(sessionId) {
+  const s = SIGNALS.get(String(sessionId || '')) || SIGNALS.get(_activeSession)
+  return projectRealm(s && s.cwd)
+}
+
+const _warned = new Set()
+function warnOnce(key, msg) {
+  if (_warned.has(key)) return
+  _warned.add(key)
+  try { console.warn(`[dsh-memory-layer] ${msg}`) } catch { /* ignore */ }
+}
+
 function recallSectionText() {
   try {
-    const r = recallBySignals({ cwd: SIGNAL.cwd, toolCalls: SIGNAL.toolCalls })
+    // v0.11：从未收到过 session/event → 触发式召回与自动沉淀都不会生效。
+    // 旧实现把这条链路的失败完全静默（catch 里什么都不做），用户只会觉得"记忆想不起来"。
+    if (!_sawSessionEvent) {
+      warnOnce('no-session-event', '未收到任何 session/event：触发式召回与会话自动沉淀不会生效（信号来自该事件）。请确认宿主版本暴露了 session/event，并用 /memory preview 检查。')
+    }
+    const r = buildInjection(currentSignal())
     if (!r.text) return ''
-    return `## 触发式召回（本次会话信号命中）\n${r.text}\n\n> 命中信号：${r.triggers.join(' ')}｜注入 ${r.items.length} 条（预算 ≤8 条 / ≤1200 字符）`
+    const meta = [`注入 ${r.items.length} 条 · ${r.chars} 字符 · realm=${r.realm}`]
+    if (r.triggers.length) meta.push(`命中信号 ${r.triggers.join(' ')}`)
+    return `## 记忆召回（触发命中 + 偏好/决定）\n${r.text}\n\n> ${meta.join('｜')}`
   } catch { return '' }
+}
+
+// ---------- 本地 HTTP 端点的来源校验（v0.11） ----------
+// 端点默认只接受「非浏览器直连且 Host 指向本机」或「Origin 指向本机」的请求。
+// 旧实现完全不校验：任何能访问 DSH 本地端口的进程或恶意网页（DNS rebinding）都能
+// 读全部记忆、把 approvalFallback 改成 auto、删条目。
+function isLocalHost(host) {
+  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '').split(':')[0]
+  return h === '' || h === 'localhost' || h === '127.0.0.1' || h === '::1'
+}
+function requestAllowed(req) {
+  if (process.env.DSH_MEMORY_API_NOAUTH === '1') return true
+  const allow = String(process.env.DSH_MEMORY_API_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean)
+  const origin = req && req.headers ? req.headers.origin : undefined
+  if (!origin) return isLocalHost(req?.headers?.host) // 非浏览器直连：至少确认 Host 是本机
+  if (allow.includes(origin)) return true
+  try { return isLocalHost(new URL(origin).host) } catch { return false }
 }
 
 // v0.8.1：按需抽取持有的宿主服务上下文（在 ctx.inject(['sessions','llm']) 的回调里赋值）
@@ -93,29 +152,21 @@ function readBody(req) {
 function makeMemoryTool(ctx) {
   return {
     name: 'memory',
+    // v0.11：描述从 14 行压到 7 行。工具 description 每轮对话都会进 system prompt，
+    // 300+ token 的固定开销对一个以"省 token"为卖点的插件很不合算；完整用法见 /memory help。
     description: [
-      '跨会话记忆系统：保存/查询值得记住的事实、偏好、教训。',
-      '三层概念：Memory=存储层（所有条目）；Retrieved=查询候选（query/list 返回的子集）；',
-      'Applied=实际注入 prompt 的内容（会话启动时冻结的快照，见记忆快照段）。查询≠注入，检索到不代表已采用。',
-      '用法: memory action=add text="..." [track=user|agent] [source="来源说明"] —— 保存（重要项自动请求审批，审批不可用时按配置自动保存）',
-      '      ⚠️ 写入去重（v0.8.0）：若与已有同类条目高度相似（默认 bigram 相似度 ≥0.7），不会新增，而是返回相似条目的 fp 与提示——此时应改用 update 合并，不要换措辞硬写第二条',
-      '      memory action=query text="关键词" [projectId=项目] [topK=10] [minWeight=0.1] [fragmentTypes=decision,preference] [includeArchived=false] —— 查询',
-      '      memory action=update fp="指纹" text="新内容" —— 编辑一条（保留锁定/权重）',
-      '      memory action=remove fp="指纹" —— 删除一条（自动备份，可回滚）',
-      '      memory action=restore fp="指纹" —— 从最近备份回滚被删除的一条',
-      '      memory action=list —— 列出全部条目',
-      '      memory action=pin fp="指纹" —— 锁定（不参与衰减；注意：锁定=不遗忘，不自动参与执行）',
-      '      memory action=unpin fp="指纹" —— 解锁',
-      '      memory action=compact [dryRun=true] —— 按五条规则清理（墓碑 + 降权，写 compact.log）',
-      '      memory action=dump —— 把活跃记忆按类型导出成 Markdown（人类可读）',
-      '保存原则：用户偏好/纠正/项目决策/踩坑教训要保存；琐事、一次性路径、可从代码重新推导的事实不保存。',
-      '记忆类别（自动推断，写入时记录）：user_decision=用户明确决定 / user_preference=用户偏好 / fact=普通事实',
-      '/ model_suggestion=模型建议 / model_inference=模型推测（建议≠决定，模型推测永远不能当作用户已拍板）。',
+      '跨会话记忆：保存/查询值得记住的偏好、决定与教训。查询≠注入（检索到不代表已采用）。',
+      'action=add text="..." [track=user|agent] —— 保存（重要项走审批；与已有条目高度相似时会合并，或提示改用 update）',
+      'action=query text="关键词" [topK=10] [includeArchived=false] —— 查询（关键词命中会记一次"真实使用"）',
+      'action=used fp="指纹" —— 标记"这条刚才真的用上了"（推进 last_used；与"被注入"区分开）',
+      'action=update fp="..." text="新内容" / remove fp（墓碑，可 restore）/ purge fp（物理删除，不可逆）',
+      'action=list | pin fp | unpin fp | compact [dryRun=true] | dump',
+      '保存原则：偏好/纠正/决策/教训要存；琐事、一次性路径、可从代码重新推导的事实不存。',
     ].join('\n'),
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['add', 'query', 'update', 'remove', 'restore', 'list', 'pin', 'unpin', 'compact', 'dump'], description: '操作' },
+        action: { type: 'string', enum: ['add', 'query', 'update', 'remove', 'purge', 'restore', 'list', 'pin', 'unpin', 'used', 'compact', 'dump'], description: '操作' },
         text: { type: 'string', description: 'add 的内容、query 的关键词、update 的新内容' },
         track: { type: 'string', enum: ['user', 'agent'], description: 'user=用户偏好/知识；agent=行为/教训（默认 agent）' },
         source: { type: 'string', description: 'add 时信息来源说明（如「用户原话」「文档 x 第 3 节」）；不填则记录会话 ID（source_ref 字段）' },
@@ -168,7 +219,7 @@ function makeMemoryTool(ctx) {
         if (!text.trim()) return { ok: false, error: 'text 必填' }
         const g = await gateWrite(ctx, { track, text: text.trim(), agent: exec.agent, callId: exec.callId, signal: exec.signal })
         if (!g.approved) return { ok: false, error: `写入未获批准（${g.outcome || 'denied'}）——重要记忆需人工审批（可设置 approvalFallback=auto 自动保存）` }
-        const r = writeEntry({ track, text: text.trim(), sessionId, approved: g.mode === 'ask', mode: g.mode, source })
+        const r = writeEntry({ track, text: text.trim(), sessionId, approved: g.mode === 'ask', mode: g.mode, source, realm: realmFor(sessionId) })
         // v0.8.0：近似重复（写入去重）——已自动合并进已有条目，或（skip 模式）只提示不写
         if (r.merged) {
           return {
@@ -203,7 +254,18 @@ function makeMemoryTool(ctx) {
       if (action === 'remove') {
         if (!fp) return { ok: false, error: 'fp 必填（先 query 找到指纹）' }
         const r = removeEntry(fp)
-        return r.ok ? { ok: true, note: `已删除 [fp:${fp}]（备份：${r.backup}，可回滚）` } : r
+        // v0.11：remove 现在是墓碑（行还在库里），不再依赖备份文件回滚
+        return r.ok ? { ok: true, note: `已删除 [fp:${fp}]（墓碑，未物理删除；/memory undo ${fp} 或 memory action=restore 可回滚；确需抹除用 purge）` } : r
+      }
+      if (action === 'purge') {
+        if (!fp) return { ok: false, error: 'fp 必填（先 query 找到指纹）' }
+        const r = purgeEntry(fp)
+        return r.ok ? { ok: true, note: `已物理删除 [fp:${fp}]（不可逆；不留备份副本，需要事前快照请先 dump）` } : r
+      }
+      if (action === 'used') {
+        if (!fp) return { ok: false, error: 'fp 必填' }
+        const r = markUsed(fp)
+        return r.ok ? { ok: true, note: `已记一次真实使用 [fp:${fp}]（累计 ${r.hits} 次）` } : r
       }
       if (action === 'restore') {
         if (!fp) return { ok: false, error: 'fp 必填' }
@@ -217,7 +279,7 @@ function makeMemoryTool(ctx) {
       }
       if (action === 'compact') {
         const r = compact({ dryRun: dryRun === true })
-        const head = `${dryRun === true ? '【预览】' : ''}扫描 ${r.scanned} 条：墓碑 ${r.tombstoned} · 降权 ${r.decayed}`
+        const head = `${dryRun === true ? '【预览】' : ''}扫描 ${r.scanned} 条：墓碑 ${r.tombstoned} · 降权 ${r.decayed} · 锁定豁免 ${r.skippedPinned}${r.backup ? ` · 备份 ${r.backup}` : ''}`
         return { ok: true, note: r.log.length ? `${head}\n${r.log.slice(0, 15).join('\n')}` : head }
       }
       if (action === 'dump') {
@@ -270,7 +332,7 @@ function registerMemoryCommand(ctx) {
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.commands.register({
       name: 'memory',
-      description: '记忆管理：list / query <词> / add <内容> / edit <fp> <新内容> / remove <fp> / undo <fp> / pin <fp> / unpin <fp> / entries [词] / compact [--dry-run] / dump',
+      description: '记忆管理：list / query <词> / add <内容> / edit <fp> <新内容> / remove <fp> / purge <fp> / undo <fp> / used <fp> / pin <fp> / unpin <fp> / unarchive <fp> / entries [词] / stats / why <fp> / preview / compact [--dry-run] / dump / help',
       handler(invocation) {
         const { rawInput, agent } = invocation
         const tokens = (rawInput || '').trim().split(/\s+/)
@@ -303,7 +365,77 @@ function registerMemoryCommand(ctx) {
           const fp = rest[0]
           if (!fp) return { kind: 'success', text: '用法: /memory remove <fp>' }
           const r = removeEntry(fp)
-          return { kind: 'success', text: r.ok ? `已删除 [fp:${fp}]（备份：${r.backup}，/memory undo ${fp} 可回滚）` : r.error }
+          return { kind: 'success', text: r.ok ? `已删除 [fp:${fp}]（墓碑，未物理删除；/memory undo ${fp} 可回滚；确需抹除用 /memory purge ${fp}）` : r.error }
+        }
+        if (verb === 'purge') {
+          const fp = rest[0]
+          if (!fp) return { kind: 'success', text: '用法: /memory purge <fp>（物理删除，不可逆）' }
+          const r = purgeEntry(fp)
+          return { kind: 'success', text: r.ok ? `已物理删除 [fp:${fp}]（不可逆；不留备份副本）` : r.error }
+        }
+        if (verb === 'used') {
+          const fp = rest[0]
+          if (!fp) return { kind: 'success', text: '用法: /memory used <fp>' }
+          const r = markUsed(fp)
+          return { kind: 'success', text: r.ok ? `已记一次真实使用 [fp:${fp}]（累计 ${r.hits} 次）` : r.error }
+        }
+        if (verb === 'unarchive') {
+          const fp = rest[0]
+          if (!fp) return { kind: 'success', text: '用法: /memory unarchive <fp>' }
+          const r = unarchiveEntry(fp)
+          return { kind: 'success', text: r.ok ? `已取消归档 [fp:${fp}]` : r.error }
+        }
+        // ---- v0.11：可观测性三件套（记忆类产品的一切问题最终都是信任问题） ----
+        if (verb === 'stats') {
+          const h = db.health()
+          const s = db.stats()
+          const fmt = (o) => Object.entries(o).map(([k, v]) => `${k}:${v}`).join(' ') || '无'
+          return {
+            kind: 'success',
+            text: [
+              `活跃记忆 ${h.active} 条（锁定 ${h.pinned}）· 墓碑 ${h.tombstoned} · 归档 ${h.archived} · 工作流链 ${h.chains}`,
+              `trigger 覆盖率 ${h.triggerCoverage}% —— ${h.active - h.noTrigger} 条可被触发召回命中；**${h.noTrigger} 条没有任何 trigger**，只能靠偏好/决定通道或常驻快照出场`,
+              `类型分布：${fmt(h.byType)}`,
+              `realm 分布：${fmt(h.byRealm)}`,
+              `库文件：${s.dbPath}`,
+            ].join('\n'),
+          }
+        }
+        if (verb === 'why') {
+          const fp = rest[0]
+          if (!fp) return { kind: 'success', text: '用法: /memory why <fp>' }
+          const r = explain(fp, currentSignal())
+          return { kind: 'success', text: r.ok ? r.reasons.map((x, i) => `${i + 1}. ${x}`).join('\n') : r.error }
+        }
+        if (verb === 'preview') {
+          const r = buildInjection(currentSignal())
+          if (!r.text) return { kind: 'success', text: '（本次会话信号没有命中任何记忆，也不会注入任何内容）' }
+          return {
+            kind: 'success',
+            text: [
+              r.text,
+              '',
+              `> realm=${r.realm} · 共 ${r.items.length} 条 / ${r.chars} 字符（偏好通道 ${r.decisionItems.length} · 触发命中 ${r.triggerItems.length} · 冷启动 ${r.coldItems.length}）`,
+              r.triggers.length ? `> 命中信号：${r.triggers.join(' ')}` : '> 命中信号：无',
+            ].join('\n'),
+          }
+        }
+        if (verb === 'help') {
+          return { kind: 'success', text: [
+            '/memory list —— 列出全部活跃记忆',
+            '/memory query <词> —— 关键词查询（命中会记一次真实使用）',
+            '/memory add <内容> —— 写入一条',
+            '/memory edit <fp> <新内容> / entries [词] —— 编辑 / 带元数据浏览',
+            '/memory remove <fp> —— 标墓碑（可 undo 回滚）',
+            '/memory purge <fp> —— **物理删除**（不可逆，不留备份副本）',
+            '/memory undo <fp> / unarchive <fp> —— 回滚墓碑 / 取消归档',
+            '/memory used <fp> —— 标记"这条刚才真的用上了"（推进 last_used）',
+            '/memory pin <fp> / unpin <fp> —— 锁定（不遗忘、豁免清理）/ 解锁',
+            '/memory stats —— 健康度（含 trigger 覆盖率）',
+            '/memory why <fp> —— 这条记忆为什么（不）会被注入',
+            '/memory preview —— 预览本次会话会注入什么',
+            '/memory compact [--dry-run] / dump —— 清理 / 导出 Markdown',
+          ].join('\n') }
         }
         if (verb === 'undo') {
           const fp = rest[0]
@@ -330,15 +462,16 @@ function registerMemoryCommand(ctx) {
           return { kind: 'success', text: r.ok ? `已${verb === 'pin' ? '锁定' : '解锁'} [fp:${fp}]` : r.error }
         }
         if (verb === 'compact') {
-          const r = compact({ dryRun: rest.includes('--dry-run') })
-          const head = `${rest.includes('--dry-run') ? '【预览】' : ''}扫描 ${r.scanned} 条：墓碑 ${r.tombstoned} · 降权 ${r.decayed}`
+          const dry = rest.includes('--dry-run')
+          const r = compact({ dryRun: dry })
+          const head = `${dry ? '【预览】' : ''}扫描 ${r.scanned} 条：墓碑 ${r.tombstoned} · 降权 ${r.decayed} · 锁定豁免 ${r.skippedPinned}${r.backup ? ` · 备份 ${r.backup}` : ''}`
           return { kind: 'success', text: r.log.length ? `${head}\n${r.log.slice(0, 15).join('\n')}` : head }
         }
         if (verb === 'dump') {
           const r = dump()
           return { kind: 'success', text: `已导出 ${r.total} 条到 ${r.file}（工作流链 ${r.chains} 条）` }
         }
-        return { kind: 'success', text: '用法: /memory list | query <词> | add <内容> | edit <fp> <新内容> | remove <fp> | undo <fp> | pin <fp> | unpin <fp> | entries [词] | compact | dump' }
+        return { kind: 'success', text: '用法: /memory help（查看全部子命令）｜常用：list / query <词> / add <内容> / remove <fp> / stats / why <fp> / preview / compact' }
       },
     })
   })
@@ -360,6 +493,14 @@ export function apply(ctx, config = {}) {
     if (migrateResult.migrated) dbgLog(`migrate: imported=${migrateResult.imported}`)
   } catch (err) {
     dbgLog(`migrate failed: ${String(err && err.message || err)}`)
+  }
+  // v0.11：指纹算法升级（前 20 字 → 全文 sha1）后的一次性重算，只跑一次。
+  // 不重算的话，旧库里那些因前 20 字撞车而"看起来重复"的条目会一直保持坏 fp。
+  try {
+    const fpMigrate = migrateFingerprints()
+    if (fpMigrate.migrated) dbgLog(`fingerprint migration: changed=${fpMigrate.changed} deduped=${fpMigrate.deduped}`)
+  } catch (err) {
+    dbgLog(`fingerprint migration failed: ${String(err && err.message || err)}`)
   }
   // 配置优先级：bundle 传入 config > 持久化 biomemory.config.json > 默认值
   const persisted = loadConfig()
@@ -384,6 +525,9 @@ export function apply(ctx, config = {}) {
   })
 
   // 1.5 会话结束自动沉淀（v0.6）：turn/end(completed) 后注入总结指令
+  // v0.11：这里的 catch 是**静默**的——一旦宿主不暴露 session/event，触发式召回与自动沉淀
+  // 会一起失效且毫无提示。补偿手段放在 recallSectionText()：从未收到事件时 warn 一次，
+  // 用户可用 /memory preview 与 /memory stats 自查。
   try {
     ctx.on('session/event', (session, rawEvent) => {
       handleSessionEvent(session, rawEvent)
@@ -419,12 +563,16 @@ export function apply(ctx, config = {}) {
           res.end(JSON.stringify(body))
         }
         try {
+          // v0.11：来源校验。端点默认不接受跨站请求（详见 requestAllowed 注释）。
+          if (!requestAllowed(req)) {
+            return send(403, { ok: false, error: 'forbidden: 跨站请求被拒绝。如需放开请设置 DSH_MEMORY_API_ORIGINS，或 DSH_MEMORY_API_NOAUTH=1 关闭校验。' })
+          }
           if (req.method === 'GET' && p === '/status') {
             const s = db.stats()
             const conn = db.openDb()
             const byType = conn.prepare('SELECT fragment_type AS k, COUNT(*) AS c FROM entries GROUP BY fragment_type ORDER BY c DESC').all().map((r) => ({ key: r.k, count: r.c }))
             const byWeight = conn.prepare("SELECT CASE WHEN weight >= 10 THEN '10+' WHEN weight >= 5 THEN '5-9' WHEN weight >= 3 THEN '3-4' ELSE '<3' END AS k, COUNT(*) AS c FROM entries GROUP BY k ORDER BY c DESC").all().map((r) => ({ key: r.k, count: r.c }))
-            return send(200, { ok: true, stats: { total: s.total, pinned: s.pinned, layers: s.layers, memoryRoot: MEMORY_ROOT, dbPath: s.dbPath, migration: db.migrationStatus(), byType, byWeight }, config: CFG })
+            return send(200, { ok: true, stats: { total: s.total, pinned: s.pinned, layers: s.layers, status: s.status, memoryRoot: MEMORY_ROOT, dbPath: s.dbPath, migration: db.migrationStatus(), byType, byWeight }, health: db.health(), config: CFG })
           }
           if (req.method === 'GET' && p === '/config') {
             return send(200, { ok: true, config: CFG })
@@ -432,7 +580,7 @@ export function apply(ctx, config = {}) {
           if (req.method === 'POST' && p === '/config') {
             let body = {}
             try { body = JSON.parse(await readBody(req)) } catch { /* ignore */ }
-            const allowed = ['decayThreshold', 'weightCap', 'hotTokenLimit', 'maxQueryResults', 'approvalFallback', 'nearDuplicateThreshold', 'nearDuplicateAction', 'sinkWindowMinutes']
+            const allowed = ['decayThreshold', 'weightCap', 'hotTokenLimit', 'maxQueryResults', 'approvalFallback', 'nearDuplicateThreshold', 'nearDuplicateAction', 'sinkWindowMinutes', 'decisionChannelMax', 'decisionChannelChars', 'coldStartFallbackMax']
             if (body.reset === true) {
               try { fs.unlinkSync(PATHS.config) } catch { /* ignore */ }
               setConfig({ ...DEFAULTS })
@@ -459,7 +607,6 @@ export function apply(ctx, config = {}) {
             const q = url.searchParams.get('q') || ''
             const layer = url.searchParams.get('layer') || ''
             const limit = Math.min(500, Number(url.searchParams.get('limit')) || 200)
-            const prefsTextStr = prefsText()
             if (q) {
               // v0.6.5：带 q 时也应用 layer 筛选；queryEntries 已补齐 hits/pinned/mode/ts/kind
               const res = await queryEntries(q, limit, { minWeight: 0, layer: layer || undefined })
@@ -468,12 +615,12 @@ export function apply(ctx, config = {}) {
               for (const r of res) {
                 if (seen.has(r.fp)) continue
                 seen.add(r.fp)
-                merged.push({ layer: r.layer, fp: r.fp, kind: r.kind, mode: r.mode, weight: r.weight, hits: r.hits, ts: r.ts, pinned: r.pinned, text: r.text, fragment_type: r.fragment_type, status: entryStatus(r, prefsTextStr) })
+                merged.push({ layer: r.layer, fp: r.fp, kind: r.kind, mode: r.mode, weight: r.weight, hits: r.hits, ts: r.ts, pinned: r.pinned, text: r.text, fragment_type: r.fragment_type, status: entryStatus(r) })
               }
               return send(200, { ok: true, entries: merged.slice(0, limit) })
             }
             const all = db.listEntries({ layer: layer || undefined, limit: 1000 })
-              .map((e) => ({ layer: e.layer, fp: e.fp, kind: e.kind, mode: e.mode, weight: e.weight, hits: e.hits, ts: e.created_at, pinned: e.pinned, text: e.text, fragment_type: e.fragment_type, status: entryStatus(e, prefsTextStr) }))
+              .map((e) => ({ layer: e.layer, fp: e.fp, kind: e.kind, mode: e.mode, weight: e.weight, hits: e.hits, ts: e.created_at, pinned: e.pinned, text: e.text, fragment_type: e.fragment_type, status: entryStatus(e) }))
             all.sort((a, b) => (b.pinned - a.pinned) || (b.weight - a.weight) || String(b.ts || '').localeCompare(String(a.ts || '')))
             return send(200, { ok: true, entries: all.slice(0, limit) })
           }
@@ -521,10 +668,6 @@ export function apply(ctx, config = {}) {
   })
 }
 
-async function readBodyJson(req) {
-  try { return JSON.parse(await readBody(req)) } catch { return {} }
-}
-
 // ---------- 测试用内部接口（不参与 DSH 装配） ----------
 
 export const __internals = {
@@ -537,7 +680,10 @@ export const __internals = {
   zhBigrams,
   consolidateHits,
   removeEntry,
+  purgeEntry,
+  markUsed,
   restoreEntry,
+  unarchiveEntry,
   updateEntryText,
   entryStatus,
   tokenize,
@@ -545,6 +691,10 @@ export const __internals = {
   compact,
   dump,
   recallBySignals,
+  buildInjection,
+  explain,
+  health: db.health,
+  migrateFingerprints,
   setPin,
   scanAllFiles,
   migrateMarkdownToDb,
@@ -554,5 +704,8 @@ export const __internals = {
   clearSummaryPending,
   setConfig: (c) => { setConfig(c) },
   getConfig: () => ({ ...CFG }),
+  requestAllowed,
+  realmFor,
+  currentSignal,
   paths: PATHS,
 }
