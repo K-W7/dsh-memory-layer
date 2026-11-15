@@ -60,7 +60,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KLRSL/dsh-memory-layer.git"
+    "url": "git+https://github.com/K-W7/dsh-memory-layer.git"
   },
   "keywords": [
     "dsh",
@@ -71,9 +71,9 @@
     "sqlite",
     "local-first"
   ],
-  "homepage": "https://github.com/KLRSL/dsh-memory-layer#readme",
+  "homepage": "https://github.com/K-W7/dsh-memory-layer#readme",
   "bugs": {
-    "url": "https://github.com/KLRSL/dsh-memory-layer/issues"
+    "url": "https://github.com/K-W7/dsh-memory-layer/issues"
   },
   "dependencies": {}
 }
